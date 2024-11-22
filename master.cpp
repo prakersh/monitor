@@ -6,6 +6,9 @@
 #include <sstream>
 #include <chrono>
 #include <iomanip>
+#include <filesystem>
+
+namespace fs = std::filesystem;
 
 using namespace sw::redis;
 
@@ -200,6 +203,73 @@ void send_command(Redis &redis, const std::string &hostname, const std::string &
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
+// Helper function to create a tar archive of a folder
+std::string create_tar_archive(const std::string& folder_path) {
+    if (!fs::exists(folder_path)) {
+        throw std::runtime_error("Source path does not exist: " + folder_path);
+    }
+    
+    if (!fs::is_directory(folder_path)) {
+        throw std::runtime_error("Source path is not a directory: " + folder_path);
+    }
+    
+    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
+    
+    // Change to use -C with the actual directory and . to tar current directory contents
+    std::string cmd = "tar -cf " + temp_tar + " -C " + folder_path + " .";
+    
+    int result = system(cmd.c_str());
+    if (result != 0) {
+        throw std::runtime_error("Failed to create tar archive. Command: " + cmd);
+    }
+    
+    // Read the tar file into memory
+    std::ifstream tar_file(temp_tar, std::ios::binary);
+    if (!tar_file.is_open()) {
+        std::remove(temp_tar.c_str());
+        throw std::runtime_error("Failed to read tar archive");
+    }
+    
+    std::stringstream buffer;
+    buffer << tar_file.rdbuf();
+    tar_file.close();
+    
+    // Clean up temporary tar file
+    std::remove(temp_tar.c_str());
+    
+    return buffer.str();
+}
+
+// Helper function to extract a tar archive
+void extract_tar_archive(const std::string& tar_content, const std::string& dest_path) {
+    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
+    auto logger = Logger::getInstance();
+
+     
+    // Write the tar content to temporary file
+    std::ofstream tar_file(temp_tar, std::ios::binary);
+    tar_file << tar_content;
+    tar_file.close();
+    std::string temp_path = fs::path(dest_path).parent_path().string();
+    if (temp_path.empty()) {
+        temp_path = "./";
+    }
+    logger->info("FILE", "Extracting tar archive to: " + temp_path);
+    
+    // Extract the tar archive
+    std::string cmd = "mkdir -p " + temp_path +"; tar -xf " + temp_tar + " -C " + temp_path;
+    
+    logger->info("FILE", "Command: " + cmd);
+    int result = system(cmd.c_str());
+    
+    // Clean up temporary tar file
+    std::remove(temp_tar.c_str());
+    
+    if (result != 0) {
+        throw std::runtime_error("Failed to extract tar archive");
+    }
+}
+
 
 // List all connected agents
 void list_agents(Redis &redis) {
@@ -233,49 +303,62 @@ void send_file_to_agent(Redis &redis, const std::string &hostname,
     logger->fileTransfer(hostname, "WRITE", "STARTED", 
                         "Local: " + local_path + " -> Remote: " + remote_path);
     
-    std::ifstream file(local_path, std::ios::binary);
-    if (!file.is_open()) {
-        logger->error("FILE", "Failed to open local file: " + local_path);
-        return;
-    }
+    std::string content;
+    bool is_directory = fs::is_directory(local_path);
     
-    std::stringstream buffer;
-    buffer << file.rdbuf();
-    std::string content = buffer.str();
-    file.close();
-    
-    auto uuid = generate_uuid();
-    std::string transfer_key = "file_transfer:" + hostname + ":" + uuid;
-    
-    logger->info("FILE", "---- File Transfer Started ----");
-    logger->info("FILE", "Host: " + hostname + ", Operation: WRITE");
-    logger->info("FILE", "Local file: " + local_path);
-    logger->info("FILE", "Remote file: " + remote_path);
-    
-    // Store file transfer information in Redis using individual hset calls
-    redis.hset(transfer_key, "operation", "write");
-    redis.hset(transfer_key, "path", remote_path);
-    redis.hset(transfer_key, "content", content);
-    
-    // Wait for completion
-    while (true) {
-        auto status = redis.hget(transfer_key, "status");
-        if (status) {
-            if (*status == "completed") {
-                std::cout << "File transfer completed successfully" << std::endl;
-                logger->info("FILE", "File transfer completed successfully");
-                redis.del(transfer_key);
-                break;
-            } else if (*status == "error") {
-                auto error = redis.hget(transfer_key, "error");
-                std::cerr << "File transfer failed: " << (error ? *error : "Unknown error") << std::endl;
-                logger->error("FILE", "File transfer failed: " + (error ? *error : "Unknown error"));
-                redis.del(transfer_key);
-                break;
+    try {
+        if (is_directory) {
+            logger->info("FILE", "Detected directory transfer");
+            content = create_tar_archive(local_path);
+        } else {
+            std::ifstream file(local_path, std::ios::binary);
+            if (!file.is_open()) {
+                logger->error("FILE", "Failed to open local file: " + local_path);
+                return;
             }
+            std::stringstream buffer;
+            buffer << file.rdbuf();
+            content = buffer.str();
+            file.close();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        
+        auto uuid = generate_uuid();
+        std::string transfer_key = "file_transfer:" + hostname + ":" + uuid;
+        
+        logger->info("FILE", "---- File Transfer Started ----");
+        logger->info("FILE", "Host: " + hostname + ", Operation: WRITE");
+        logger->info("FILE", "Local path: " + local_path);
+        logger->info("FILE", "Remote path: " + remote_path);
+        
+        // Store file transfer information in Redis
+        redis.hset(transfer_key, "operation", "write");
+        redis.hset(transfer_key, "path", remote_path);
+        redis.hset(transfer_key, "content", content);
+        redis.hset(transfer_key, "is_directory", is_directory ? "1" : "0");
+        
+        // Monitor transfer status
+        while (true) {
+            auto status = redis.hget(transfer_key, "status");
+            if (status) {
+                if (*status == "completed") {
+                    std::cout << "File transfer completed successfully" << std::endl;
+                    logger->info("FILE", "Transfer completed successfully");
+                    redis.del(transfer_key);
+                    break;
+                } else if (*status == "error") {
+                    auto error = redis.hget(transfer_key, "error");
+                    logger->error("FILE", "Transfer failed: " + (error ? *error : "Unknown error"));
+                    redis.del(transfer_key);
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        
+    } catch (const std::exception& e) {
+        logger->error("FILE", "Transfer error: " + std::string(e.what()));
     }
+    
     logger->info("FILE", "---------------------------");
 }
 
@@ -284,17 +367,57 @@ void receive_file_from_agent(Redis &redis, const std::string &hostname,
                            const std::string &remote_path, const std::string &local_path) {
     auto logger = Logger::getInstance();
     
+    // First check if remote path is a directory
+    auto check_uuid = generate_uuid();
+    std::string check_key = "file_transfer:" + hostname + ":" + check_uuid;
+    redis.hset(check_key, "operation", "check_type");
+    redis.hset(check_key, "path", remote_path);
+    
+    bool is_directory = false;
+    logger->info("FILE", "Checking remote path type: " + remote_path);
+    
+    // Wait for type check response
+    while (true) {
+        auto status = redis.hget(check_key, "status");
+        if (status && *status == "completed") {
+            auto type = redis.hget(check_key, "type");
+            is_directory = (type && *type == "directory");
+            logger->info("FILE", std::string("Remote path is ") + (is_directory ? "directory" : "file"));
+            redis.del(check_key);
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    
+    // Create parent directory if needed
+    try {
+        fs::path local_fs_path(local_path);
+        if (is_directory) {
+            // For directories, create the target directory itself
+            fs::create_directories(local_fs_path);
+        } else {
+            // For files, create parent directory if needed
+            if (local_fs_path.has_parent_path()) {
+                fs::create_directories(local_fs_path.parent_path());
+            }
+        }
+    } catch (const fs::filesystem_error& e) {
+        logger->error("FILE", "Failed to create directory structure: " + std::string(e.what()));
+        throw;
+    }
+    
+    // Now proceed with actual transfer
     auto uuid = generate_uuid();
     std::string transfer_key = "file_transfer:" + hostname + ":" + uuid;
     
     logger->info("FILE", "---- File Transfer Request ----");
     logger->info("FILE", "Host: " + hostname + ", Operation: READ");
-    logger->info("FILE", "Remote file: " + remote_path);
-    logger->info("FILE", "Local file: " + local_path);
+    logger->info("FILE", std::string("Remote ") + (is_directory ? "directory" : "file") + ": " + remote_path);
+    logger->info("FILE", "Local path: " + local_path);
     
-    // Store file transfer request in Redis using individual hset calls
     redis.hset(transfer_key, "operation", "read");
     redis.hset(transfer_key, "path", remote_path);
+    redis.hset(transfer_key, "is_directory", is_directory ? "1" : "0");
     
     // Wait for response
     while (true) {
@@ -303,15 +426,24 @@ void receive_file_from_agent(Redis &redis, const std::string &hostname,
             if (*status == "completed") {
                 auto content = redis.hget(transfer_key, "content");
                 if (content) {
-                    std::ofstream file(local_path, std::ios::binary);
-                    if (file.is_open()) {
-                        file << *content;
-                        file.close();
+                    try {
+                        if (is_directory) {
+                            logger->info("FILE", "Extracting directory contents to: " + local_path);
+                            extract_tar_archive(*content, local_path);
+                            logger->info("FILE", "Directory extraction completed");
+                        } else {
+                            std::ofstream file(local_path, std::ios::binary);
+                            if (!file.is_open()) {
+                                throw std::runtime_error("Failed to open local file for writing");
+                            }
+                            file << *content;
+                            file.close();
+                        }
                         std::cout << "File transfer completed successfully" << std::endl;
-                        logger->info("FILE", "File transfer completed successfully");
-                    } else {
-                        std::cerr << "Failed to save file locally: " << local_path << std::endl;
-                        logger->error("FILE", "Failed to save file: " + local_path);
+                        logger->info("FILE", "Transfer completed successfully");
+                    } catch (const std::exception& e) {
+                        std::cerr << "Transfer failed: " << e.what() << std::endl;
+                        logger->error("FILE", "Transfer failed: " + std::string(e.what()));
                     }
                 }
                 redis.del(transfer_key);
@@ -319,7 +451,7 @@ void receive_file_from_agent(Redis &redis, const std::string &hostname,
             } else if (*status == "error") {
                 auto error = redis.hget(transfer_key, "error");
                 std::cerr << "File transfer failed: " << (error ? *error : "Unknown error") << std::endl;
-                logger->error("FILE", "File transfer failed: " + (error ? *error : "Unknown error"));
+                logger->error("FILE", "Transfer failed: " + (error ? *error : "Unknown error"));
                 redis.del(transfer_key);
                 break;
             }
