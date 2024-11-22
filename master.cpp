@@ -116,6 +116,10 @@ std::string generate_uuid() {
 void send_command(Redis &redis, const std::string &hostname, const std::string &command) {
     auto logger = Logger::getInstance();
     
+    // Add these lines near the start of the function to get user and pwd
+    auto user = redis.get(hostname + "_user");
+    auto pwd = redis.get(hostname + "_pwd");
+    
     // Log command initiation
     logger->command(hostname, command, "INITIATED");
     
@@ -486,18 +490,26 @@ void handle_cli_input(Redis &redis, int argc, char *argv[]) {
                 std::cout << "Usage: ./master 3 <hostname>\n";
                 return;
             }
-            std::cout << "Entering moni.sh for " << argv[2] << ":\n";
-            while (true) {
-                std::string command;
-                std::getline(std::cin, command);
-                if (command == "exit" || command == "quit") {
-                    std::cout << "Exiting...\n";
-                    break;
+            {  // Added block scope for new variables
+                auto user = redis.get(std::string(argv[2]) + "_user");
+                auto pwd = redis.get(std::string(argv[2]) + "_pwd");
+                std::cout << "Entering moni.sh for " << argv[2] << ":\n";
+                while (true) {
+                    // Display prompt with user, hostname, and pwd
+                    std::cout << (user ? *user : "unknown") << "@" << argv[2] << ":" 
+                              << (pwd ? *pwd : "~") << "$ ";
+                    
+                    std::string command;
+                    std::getline(std::cin, command);
+                    if (command == "exit" || command == "quit") {
+                        std::cout << "Exiting...\n";
+                        break;
+                    }
+                    else if (command.empty() || command == " " || command == "\n" || command == "\t") {
+                        continue;
+                    }
+                    send_command(redis, argv[2], command);
                 }
-                else if (command.empty() || command == " " || command == "\n" || command == "\t") {
-                    continue;
-                }
-                send_command(redis, argv[2], command);
             }
             break;
 
@@ -584,8 +596,15 @@ int main(int argc, char *argv[]) {
                 std::cin >> hostname;
                 std::cin.ignore();
                 
+                auto user = redis.get(hostname + "_user");
+                auto pwd = redis.get(hostname + "_pwd");
                 std::cout << "Entering moni.sh:\n";
+                
                 while (true) {
+                    // Display prompt with user, hostname, and pwd
+                    std::cout << (user ? *user : "unknown") << "@" << hostname << ":" 
+                              << (pwd ? *pwd : "~") << "$ ";
+                    
                     std::string command;
                     std::getline(std::cin, command);
                     if (command == "exit" || command == "quit") {
@@ -593,7 +612,7 @@ int main(int argc, char *argv[]) {
                         break;
                     }
                     else if (command.empty() || command == " " || command == "\n" || command == "\t") {
-                        continue; // Skip sending the command
+                        continue;
                     }
                     send_command(redis, hostname, command);
                 }

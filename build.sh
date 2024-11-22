@@ -56,7 +56,7 @@ compile_program() {
     cp "$src" "$temp_src"
     
     # Replace Redis connection placeholders with build-time parameters
-    if [ -n "$redis_host" ] && [ -n "$redis_pass" ]; then
+    if [ -n "$redis_host" ]; then
         sed -i "s|REDIS_HOST_PLACEHOLDER|${redis_host}|g" "$temp_src"
         sed -i "s|REDIS_PASS_PLACEHOLDER|${redis_pass}|g" "$temp_src"
     else

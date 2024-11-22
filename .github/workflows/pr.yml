@@ -1,1 +1,23 @@
- 
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  code-quality:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Install cppcheck
+      run: sudo apt-get install -y cppcheck
+
+    - name: Static Analysis
+      run: |
+        cppcheck --enable=all --suppress=missingIncludeSystem ./*.cpp
+
+    - name: Check Format
+      run: |
+        sudo apt-get install -y clang-format
+        clang-format -n *.cpp 
