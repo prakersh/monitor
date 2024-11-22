@@ -79,6 +79,61 @@ compile_program() {
     fi
 }
 
+# Add this function at the end of the existing build.sh
+create_installer() {
+    local temp_dir=$(mktemp -d)
+    local installer="monitor_installer"
+    
+    echo "Creating installer package..."
+    
+    # Ensure files exist before copying
+  if [ ! -f "agent" ] || [ ! -f "monitor.service" ]; then
+      echo "Error: Required files not found"
+      echo "Please ensure 'agent' and 'monitor.service' exist in current directory"
+      rm -rf "$temp_dir"
+      exit 1
+  fi
+    
+    # Copy files to temp directory
+    cp agent monitor.service "$temp_dir/"
+    
+    # Create tar archive
+    cd "$temp_dir" || exit 1
+    tar czf payload.tar.gz agent monitor.service
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to create tar archive"
+        cd - || exit 1
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    cd - || exit 1
+    
+    # Verify tar file was created
+    if [ ! -f "$temp_dir/payload.tar.gz" ]; then
+        echo "Error: Tar file not created"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    
+    # Create self-extracting installer
+    cp monitor_inst.sh "$installer"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to copy installer script"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
+    
+    # Append payload marker and base64 encoded content
+    echo "" >> "$installer"
+    echo "__PAYLOAD_FOLLOWS__" >> "$installer"
+    base64 "$temp_dir/payload.tar.gz" >> "$installer"
+    
+    chmod +x "$installer"
+    rm -rf "$temp_dir"
+    
+    echo "Created self-extracting installer: $installer"
+}
+
 # Parse command line arguments
 REDIS_HOST="prakersh.in"
 REDIS_PASS="Jmnwgh87nOCVOWc6RYuQbNa/5DmDon3uQEjVAHbJ2Vj5xNeSvw4urxydZxeeEbkP4YCrGPb3OiYknuvk"
@@ -113,6 +168,32 @@ case $BUILD_TARGET in
     "all")
         compile_program "agent.cpp" "agent" "$REDIS_HOST" "$REDIS_PASS" || exit 1
         compile_program "master.cpp" "master" "$REDIS_HOST" "$REDIS_PASS" || exit 1
+        
+        # Create monitor.service file
+        cat > monitor.service << 'EOL'
+[Unit]
+Description=Remote System Management Agent
+After=network.target
+Wants=network.target
+
+[Service]
+Type=forking
+ExecStart=/etc/monitor/agent
+ExecStop=/etc/monitor/agent -k
+PIDFile=/tmp/agent.pid
+Restart=always
+RestartSec=5
+StartLimitInterval=0
+StartLimitBurst=100
+KillMode=process
+TimeoutStopSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOL
+        
+        create_installer
         ;;
     "agent")
         compile_program "agent.cpp" "agent" "$REDIS_HOST" "$REDIS_PASS" || exit 1
