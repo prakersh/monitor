@@ -49,6 +49,7 @@ All other dependencies (GCC, CMake, Redis++, etc.) will be automatically install
 - Sudo access
 
 ### Quick Start
+
 1. Clone the repository:
 ```bash
 git clone https://github.com/prakersh/monitor.git
@@ -60,9 +61,15 @@ cd monitor
 ./build.sh --redis-host your.redis.host --redis-pass your_password
 ```
 
+This will create:
+- `master`: Master executable
+- `agent`: Agent executable
+- `monitor_installer`: Self-extracting installer for agent deployment
+
 ### Build Options
+
 ```bash
-# Build both master and agent
+# Build both master and agent with installer
 ./build.sh --redis-host your.redis.host --redis-pass your_password
 
 # Build specific component
@@ -76,9 +83,49 @@ cd monitor
 - `--target`: Component to build (optional)
   - Valid targets: all, agent, master (default: all)
 
-### Build Process
+### Agent Deployment
+
+The build process creates a self-extracting installer (`monitor_installer`) that simplifies agent deployment. This installer:
+- Packages the agent executable and service file
+- Handles installation and service setup
+- Supports custom installation paths
+- Provides extract-only option for manual setup
+
+To deploy an agent:
+
+1. Copy the installer to target machine:
+```bash
+scp monitor_installer user@remote:/tmp/
+```
+
+2. Run the installer:
+```bash
+# Default installation (/etc/monitor)
+sudo ./monitor_installer
+
+# Custom installation path
+sudo ./monitor_installer -p /opt/monitor
+
+# Extract only (no service installation)
+./monitor_installer -e -p /path/to/extract
+```
+
+The installer will:
+- Extract agent files to specified location
+- Install systemd service file
+- Configure automatic startup
+- Start the agent service
+
+**Installer Options:**
+- `-p <path>`: Custom installation path
+- `-e`: Extract files only, don't install service
+
+### Build Process Details
+
+The build script performs several key functions:
+
 1. **Dependency Check:**
-   - Automatically verifies and installs required packages
+   - Verifies and installs required packages
    - Installs Redis++ if not present
    - Requires sudo access for package installation
 
@@ -87,9 +134,39 @@ cd monitor
    - Injects Redis connection details at build time
    - Creates standalone executables
 
-3. **Output:**
-   - `agent`: Agent executable
-   - `master`: Master executable
+3. **Installer Creation:**
+   - Packages agent and service files
+   - Creates self-extracting installer
+   - Embeds configuration and startup scripts
+
+### CI/CD Pipeline
+
+The project includes automated CI/CD pipeline using GitHub Actions that:
+
+1. **Build Verification:**
+   - Builds both master and agent components
+   - Verifies compilation with default configuration
+   - Ensures installer creation works correctly
+
+2. **Integration Testing:**
+   - Starts Redis service container
+   - Deploys and starts agent process
+   - Performs connectivity tests
+   - Validates file transfer functionality
+   - Tests command execution
+   - Verifies bidirectional file operations
+
+3. **Test Coverage:**
+   - Basic connectivity validation
+   - File transfer operations
+   - Command execution verification
+   - Process management testing
+
+The workflow is triggered on:
+- Push to main branch
+- Pull request to main branch
+
+Reference workflow file: `.github/workflows/ci.yml`
 
 ## Usage
 
