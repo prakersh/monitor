@@ -397,9 +397,8 @@ void handle_cli_input(Redis &redis, int argc, char *argv[]) {
 
 // Main function
 int main(int argc, char *argv[]) {
-    std::string pass = "Jmnwgh87nOCVOWc6RYuQbNa/5DmDon3uQEjVAHbJ2Vj5xNeSvw4urxydZxeeEbkP4YCrGPb3OiYknuvk";
 
-    auto redis = Redis("tcp://prakersh.in:6379?password=" + pass); 
+    auto redis = Redis("tcp://REDIS_HOST_PLACEHOLDER:6379?password=REDIS_PASS_PLACEHOLDER"); 
     std::cout << "Connected to Redis\n";
 
     // Initialize next_agent_id in Redis if it doesn't exist

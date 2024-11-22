@@ -20,10 +20,30 @@ private:
     std::ofstream log_file;
     static Logger* instance;
     std::string log_path;
+    const size_t MAX_SIZE = 10 * 1024 * 1024; // 10MB in bytes
     
     // Private constructor for singleton pattern
     Logger() {
         log_path = "agent.log";
+        log_file.open(log_path, std::ios::app);
+    }
+
+    void rotate_log() {
+        if (log_file.is_open()) {
+            log_file.close();
+        }
+
+        // Get current file size
+        struct stat stat_buf;
+        if (stat(log_path.c_str(), &stat_buf) == 0) {
+            if (stat_buf.st_size >= MAX_SIZE) {
+                // Rename current log to backup
+                std::string backup_path = log_path + ".1";
+                rename(log_path.c_str(), backup_path.c_str());
+            }
+        }
+
+        // Open new log file
         log_file.open(log_path, std::ios::app);
     }
 
@@ -45,6 +65,14 @@ public:
 
     void log(const std::string& level, const std::string& message) {
         if (log_file.is_open()) {
+            // Check file size before writing
+            struct stat stat_buf;
+            if (stat(log_path.c_str(), &stat_buf) == 0) {
+                if (stat_buf.st_size >= MAX_SIZE) {
+                    rotate_log();
+                }
+            }
+
             log_file << getCurrentTimestamp() << "\t" << level << "\t" 
                     << message << std::endl;
             log_file.flush();
@@ -434,7 +462,7 @@ int main(int argc, char* argv[]) {
         
         logger->info("Agent daemonized successfully");
 
-        auto redis = Redis("tcp://prakersh.in:6379?password=Jmnwgh87nOCVOWc6RYuQbNa/5DmDon3uQEjVAHbJ2Vj5xNeSvw4urxydZxeeEbkP4YCrGPb3OiYknuvk");
+        auto redis = Redis("tcp://REDIS_HOST_PLACEHOLDER:6379?password=REDIS_PASS_PLACEHOLDER");
         logger->info("Connected to Redis server");
 
         std::string hostname = get_hostname();
