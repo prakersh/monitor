@@ -44,6 +44,11 @@ jobs:
         ./master 4 $host test.txt /tmp/test.txt
         # Command execution test
         ./master 2 $host "ls -l /tmp/test.txt"
+        ./master 2 $host "cat /tmp/test.txt"
+        # File recieve test
+        ./master 5 $host /tmp/test.txt test2.txt
+        cat test2.txt
+        
 
     - name: Stop Agent
       run: |
