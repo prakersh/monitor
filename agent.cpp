@@ -15,6 +15,9 @@
 #include <sys/stat.h>
 #include <signal.h>
 #include <limits.h>
+#include <filesystem>
+#include <uuid/uuid.h>
+namespace fs = std::filesystem;
 class Logger {
 private:
     std::ofstream log_file;
@@ -102,6 +105,14 @@ public:
 Logger* Logger::instance = nullptr;
 
 using namespace sw::redis;
+// Generate a unique UUID
+std::string generate_uuid() {
+    uuid_t uuid;
+    char uuid_str[37];
+    uuid_generate(uuid);
+    uuid_unparse(uuid, uuid_str);
+    return std::string(uuid_str);
+}
 
 // Retrieve the hostname of the machine
 std::string get_hostname() {
@@ -111,6 +122,53 @@ std::string get_hostname() {
     }
     return "unknown";
 }
+// Helper function to create a tar archive of a folder
+std::string create_tar_archive(const std::string& folder_path) {
+    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
+    std::string cmd = "tar -cf " + temp_tar + " -C " + 
+                     fs::path(folder_path).parent_path().string() + " " + 
+                     fs::path(folder_path).filename().string();
+    
+    int result = system(cmd.c_str());
+    if (result != 0) {
+        throw std::runtime_error("Failed to create tar archive");
+    }
+    
+    // Read the tar file into memory
+    std::ifstream tar_file(temp_tar, std::ios::binary);
+    std::stringstream buffer;
+    buffer << tar_file.rdbuf();
+    tar_file.close();
+    
+    // Clean up temporary tar file
+    std::remove(temp_tar.c_str());
+    
+    return buffer.str();
+}
+
+void extract_tar_archive(const std::string& tar_content, const std::string& dest_path) {
+    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
+    
+    // Write the tar content to temporary file
+    std::ofstream tar_file(temp_tar, std::ios::binary);
+    tar_file << tar_content;
+    tar_file.close();
+    
+    // Create the destination directory itself
+    fs::create_directories(dest_path);
+    
+    // Extract the tar archive directly into the destination directory
+    std::string cmd = "tar -xf " + temp_tar + " -C " + dest_path;
+    int result = system(cmd.c_str());
+    
+    // Clean up temporary tar file
+    std::remove(temp_tar.c_str());
+    
+    if (result != 0) {
+        throw std::runtime_error("Failed to extract tar archive");
+    }
+}
+
 
 // Execute a shell command and return return code, stdout, and stderr.
 void execute_command(const std::string &cmd, int &return_code, std::string &stdout_data, std::string &stderr_data) {
@@ -189,7 +247,6 @@ void collect_and_send_metrics(Redis &redis, const std::string &hostname) {
         std::this_thread::sleep_for(std::chrono::seconds(60));
     }
 }
-
 // Listen for commands and execute those targeting this agent
 void listen_for_commands(Redis &redis, const std::string &hostname) {
     auto logger = Logger::getInstance();
@@ -282,11 +339,11 @@ void register_agent(Redis &redis, const std::string &hostname) {
         logger->info("Agent registration complete. UUID: " + std::to_string(uuid));
         
         while (true) {
-            std::this_thread::sleep_for(std::chrono::seconds(20));
             redis.set(active_key, "yes");
             redis.set(user_key, user);
             redis.expire(active_key, 50);
             logger->debug("Agent status refreshed");
+            std::this_thread::sleep_for(std::chrono::seconds(20));
         }
     } catch (const std::exception &e) {
         logger->error("Registration error: " + std::string(e.what()));
@@ -365,8 +422,8 @@ void kill_existing_instance() {
 }
 
 void print_usage() {
-    std::cout << "Usage: ./agent [-c]\n"
-              << "  -c    Kill existing agent process and exit\n";
+    std::cout << "Usage: ./agent [-k]\n"
+              << "  -k    Kill existing agent process and exit\n";
 }
 
 // Function to handle file transfers
@@ -385,62 +442,85 @@ void handle_file_transfers(Redis &redis, const std::string &hostname) {
                 
                 if (!operation || !path) continue;
                 
-                if (*operation == "write") {
+                if (*operation == "check_type") {
+                    try {
+                        bool is_dir = fs::is_directory(*path);
+                        redis.hset(key, "type", is_dir ? "directory" : "file");
+                        redis.hset(key, "status", "completed");
+                    } catch (const std::exception& e) {
+                        redis.hset(key, "status", "error");
+                        redis.hset(key, "error", e.what());
+                    }
+                } else if (*operation == "read") {
+                    try {
+                        logger->info("Checking path type: " + *path);
+                        bool is_dir = fs::is_directory(*path);
+                        std::string content;
+                        
+                        if (is_dir) {
+                            logger->info("Detected directory transfer - Source: " + *path);
+                            content = create_tar_archive(*path);
+                            redis.hset(key, "is_directory", "1");
+                            logger->info("Directory packaged successfully");
+                        } else {
+                            logger->info("Detected file transfer - Source: " + *path);
+                            std::ifstream file(*path, std::ios::binary);
+                            if (!file.is_open()) {
+                                throw std::runtime_error("Failed to open file for reading");
+                            }
+                            std::stringstream buffer;
+                            buffer << file.rdbuf();
+                            file.close();
+                            content = buffer.str();
+                            redis.hset(key, "is_directory", "0");
+                        }
+                        
+                        redis.hset(key, "content", content);
+                        redis.hset(key, "status", "completed");
+                        logger->info("Transfer completed: " + *path + (is_dir ? " (directory)" : " (file)"));
+                    } catch (const std::exception& e) {
+                        redis.hset(key, "status", "error");
+                        redis.hset(key, "error", e.what());
+                        logger->error("Read error for " + *path + ": " + std::string(e.what()));
+                    }
+                } else if (*operation == "write") {
                     auto content = redis.hget(key, "content");
+                    auto is_directory = redis.hget(key, "is_directory");
                     if (!content) continue;
                     
                     try {
-                        std::ofstream file(*path, std::ios::binary);
-                        if (!file.is_open()) {
-                            redis.hset(key, "status", "error");
-                            redis.hset(key, "error", "Failed to open file for writing");
-                            continue;
+                        if (is_directory && *is_directory == "1") {
+                            // Handle directory transfer
+                            extract_tar_archive(*content, *path);
+                        } else {
+                            // Handle regular file transfer
+                            std::ofstream file(*path, std::ios::binary);
+                            if (!file.is_open()) {
+                                throw std::runtime_error("Failed to open file for writing");
+                            }
+                            file << *content;
+                            file.close();
                         }
-                        file << *content;
-                        file.close();
                         redis.hset(key, "status", "completed");
-                        logger->info("File written successfully: " + *path);
+                        logger->info("Write completed: " + *path);
                     } catch (const std::exception& e) {
                         redis.hset(key, "status", "error");
                         redis.hset(key, "error", e.what());
-                        logger->error("File write error: " + std::string(e.what()));
-                    }
-                }
-                else if (*operation == "read") {
-                    try {
-                        std::ifstream file(*path, std::ios::binary);
-                        if (!file.is_open()) {
-                            redis.hset(key, "status", "error");
-                            redis.hset(key, "error", "Failed to open file for reading");
-                            continue;
-                        }
-                        std::stringstream buffer;
-                        buffer << file.rdbuf();
-                        file.close();
-                        
-                        redis.hset(key, "content", buffer.str());
-                        redis.hset(key, "status", "completed");
-                        logger->info("File read successfully: " + *path);
-                    } catch (const std::exception& e) {
-                        redis.hset(key, "status", "error");
-                        redis.hset(key, "error", e.what());
-                        logger->error("File read error: " + std::string(e.what()));
+                        logger->error("Write error: " + std::string(e.what()));
                     }
                 }
             }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
         } catch (const std::exception& e) {
-            logger->error("Error in file transfer handler: " + std::string(e.what()));
+            logger->error("Transfer handler error: " + std::string(e.what()));
         }
-        
-        std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 }
-
 int main(int argc, char* argv[]) {
     // Check for command line arguments
     if (argc > 1) {
         std::string arg(argv[1]);
-        if (arg == "-c") {
+        if (arg == "-k") {
             kill_existing_instance();
             std::cout << "Agent process killed.\n";
             return 0;

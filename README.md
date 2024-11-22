@@ -7,28 +7,29 @@ MONITOR is a robust distributed system that enables centralized command executio
 ### Key Features
 - **Distributed Command Execution**: Execute commands on remote agents from a central master
 - **Real-time Monitoring**: Track system metrics (CPU, RAM, load) across all agents
-- **Secure File Transfer**: Bidirectional file transfer between master and agents
+- **Secure File Transfer**: Bidirectional file/directory transfer between master and agents
 - **Interactive Shell**: Remote shell access to agents via moni.sh
 - **Automatic Recovery**: Self-healing agent processes with automatic reconnection
 - **Structured Logging**: Comprehensive logging with rotation
+
 #### Master  
-1. **Command Execution:** Send commands to agents and receive their execution results (stdout, stderr, 
-return code).  
-2. **Agent Management:** List connected agents, register new agents, and manage their states.  
-3. **File Transfer:** Send and receive files between master and agents.
-4. **Enhanced Logging:** Structured logging with categories and automatic log rotation.
+1. **Command Execution:** Send commands to agents and receive their execution results (stdout, stderr, return code)
+2. **Agent Management:** List connected agents, register new agents, and manage their states
+3. **File Transfer:** Send and receive files/directories between master and agents
+4. **Enhanced Logging:** Structured logging with categories and automatic log rotation
 5. **Interactive CLI:** Multiple operation modes including:
    - Single command execution
    - Interactive shell (moni.sh)
    - File transfer operations
-6. **Command Line Interface:** Support for both interactive and CLI modes.
+6. **Command Line Interface:** Support for both interactive and CLI modes
+
 #### Agent  
-1. **Command Listener:** Listen for and execute commands from the Master.  
-2. **Metrics Collection:** Periodically send system metrics (CPU, RAM, load average) to Redis.  
-3. **Self-Registration:** Automatically register with the Master and maintain active status.  
-4. **File Operations:** Handle file transfers (read/write) requested by Master.
-5. **Daemonization:** Run as a background service with proper process management.
-6. **Structured Logging:** Comprehensive logging system with different severity levels.
+1. **Command Listener:** Listen for and execute commands from the Master
+2. **Metrics Collection:** Periodically send system metrics (CPU, RAM, load average) to Redis
+3. **Self-Registration:** Automatically register with the Master and maintain active status
+4. **File Operations:** Handle file/directory transfers (read/write) requested by Master
+5. **Daemonization:** Run as a background service with proper process management
+6. **Structured Logging:** Comprehensive logging system with different severity levels
 
 ## System Requirements
 
@@ -50,7 +51,7 @@ All other dependencies (GCC, CMake, Redis++, etc.) will be automatically install
 ### Quick Start
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/monitor.git
+git clone https://github.com/prakersh/monitor.git
 cd monitor
 ```
 
@@ -101,11 +102,11 @@ Ensure Redis server is running and accessible by Master and Agents.
 ./agent
 
 # Stop existing agent
-./agent -c
+./agent -k
 ```
 
 **Options:**
-- `-c`: Kill existing agent process and exit
+- `-k`: Kill existing agent process and exit
 - No arguments: Start agent as daemon
 
 ### Master Application
@@ -115,7 +116,7 @@ Launch without arguments for interactive menu:
 ```bash
 ./master
 ```
-#### Interactive Mode (no arguments)
+
 Available options:
 1. List connected agents
 2. Send command to agent
@@ -135,9 +136,9 @@ Available options:
 # Open interactive shell
 ./master 3 hostname
 
-# Transfer files
-./master 4 hostname local_path remote_path  # Send file
-./master 5 hostname remote_path local_path  # Receive file
+# Transfer files/directories
+./master 4 hostname local_path remote_path  # Send file/directory
+./master 5 hostname remote_path local_path  # Receive file/directory
 ```
 
 ## Architecture
@@ -172,27 +173,36 @@ Redis keys used by the system:
 ### Agent Logs
 - Location: `agent.log`
 - Levels: INFO, ERROR, DEBUG
+- Auto-rotation: 10MB
 - Format: `timestamp level message`
 
 ## File Transfer
 
-The system supports bidirectional file transfers:
+The system supports bidirectional file and directory transfers:
 
-1. **Send File to Agent:**
+1. **Send File/Directory to Agent:**
 ```bash
 ./master 4 hostname local_path remote_path
 ```
 
-2. **Receive File from Agent:**
+2. **Receive File/Directory from Agent:**
 ```bash
 ./master 5 hostname remote_path local_path
 ```
+
+Features:
+- Automatic directory detection
+- Preserves directory structure
+- Handles binary files
+- Progress logging
+- Error handling with detailed messages
 
 ## Process Management
 
 ### Agent Process Control
 - Runs as a daemon process
 - PID stored in `/tmp/agent.pid`
+- Kill existing instance with `-k` flag
 - Automatic cleanup of existing instances
 - Graceful shutdown support
 
@@ -213,10 +223,16 @@ The system supports bidirectional file transfers:
    - Ensure proper permissions on target system
 
 3. **File Transfer Issues**
-   - Verify file permissions
+   - Verify file/directory permissions
    - Check available disk space
-   - Ensure paths are correct
+   - Ensure paths are correct and accessible
    - Review logs for transfer errors
+
+4. **Process Management Issues**
+   - Check agent.pid file exists and is valid
+   - Verify agent process is running
+   - Use `-k` flag to cleanly kill existing agent
+   - Check system logs for daemon issues
 
 ## Contributing
 1. Fork the repository
@@ -230,5 +246,5 @@ MIT License - see LICENSE file for details
 
 ## Author
 Prakersh Maheshwari  
-Email: Prakersh@live.com
+Email: Prakersh@live.com  
 LinkedIn: [Prakersh Maheshwari](https://www.linkedin.com/in/prakersh/)
