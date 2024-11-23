@@ -57,6 +57,7 @@ compile_program() {
     
     # Replace Redis connection placeholders with build-time parameters
     if [ -n "$redis_host" ]; then
+        sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" "$temp_src"
         sed -i "s|REDIS_HOST_PLACEHOLDER|${redis_host}|g" "$temp_src"
         sed -i "s|REDIS_PASS_PLACEHOLDER|${redis_pass}|g" "$temp_src"
     else
@@ -130,6 +131,7 @@ create_installer() {
     # Append payload marker and base64 encoded content
     echo "" >> "$installer"
     echo "__PAYLOAD_FOLLOWS__" >> "$installer"
+    sed -i "s|VERSION_PLACEHOLDER|${VERSION}|g" "$installer"
     base64 "$temp_dir/payload.tar.gz" >> "$installer"
     
     chmod +x "$installer"
@@ -142,6 +144,8 @@ create_installer() {
 REDIS_HOST="prakersh.in"
 REDIS_PASS=""
 BUILD_TARGET="all"
+VERSION=""
+LAST_VERSION_FILE=".last_version"
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -157,12 +161,29 @@ while [[ $# -gt 0 ]]; do
             BUILD_TARGET="$2"
             shift 2
             ;;
+        --version)
+            VERSION="$2"
+            shift 2
+            ;;
         *)
             echo "Unknown option: $1"
             exit 1
             ;;
     esac
 done
+
+# Handle version management
+if [ -z "$VERSION" ]; then
+    if [ -f "$LAST_VERSION_FILE" ]; then
+        LAST_VERSION=$(cat "$LAST_VERSION_FILE")
+        # Increment last number of version
+        VERSION=$(echo "$LAST_VERSION" | awk -F. '{$NF = $NF + 1;} 1' | sed 's/ /./g')
+    else
+        VERSION="1.0.0"
+    fi
+fi
+echo "$VERSION" > "$LAST_VERSION_FILE"
+echo "Building version: $VERSION"
 
 # Check dependencies first
 check_dependencies
