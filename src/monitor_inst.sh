@@ -17,6 +17,11 @@ while getopts "p:e" opt; do
         *) print_usage ;;
     esac
 done
+# Check if running as root
+if [ "$EUID" -ne 0 ]; then
+    echo "Error: Please run as root"
+    exit 1
+fi
 
 # Create temporary directory
 TEMP_DIR=$(mktemp -d)
