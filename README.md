@@ -64,7 +64,7 @@ cd monitor
 This will create:
 - `master`: Master executable
 - `agent`: Agent executable
-- `monitor_installer`: Self-extracting installer for agent deployment
+- `monitor`: Self-extracting installer for agent deployment
 
 ### Build Options
 
@@ -83,9 +83,53 @@ This will create:
 - `--target`: Component to build (optional)
   - Valid targets: all, agent, master (default: all)
 
+## Binary Locations
+
+After building, the following binaries will be created in the `out/` directory:
+
+1. **Master Binary:**
+   - Name: `master`
+   - Location: `out/master`
+   - Purpose: Central control application
+
+2. **Agent Binary:**
+   - Name: `agent`
+   - Location: `out/agent`
+   - Purpose: Distributed execution node
+
+3. **Monitor Installer:**
+   - Name: `monitor`
+   - Location: `out/monitor`
+   - Purpose: Self-extracting agent installer
+
+4. **Service File:**
+   - Name: `monitor.service`
+   - Location: `out/monitor.service`
+   - Purpose: Systemd service configuration
+
+### Installation Paths
+
+When using the monitor installer, files are placed in the following locations:
+
+1. **Default Installation:**
+   - Base Path: `/etc/monitor/`
+   - Agent Binary: `/etc/monitor/agent`
+   - Service File: `/etc/systemd/system/monitor.service`
+
+2. **Custom Installation:**
+   - Base Path: User specified with `-p` flag
+   - Agent Binary: `<custom_path>/agent`
+   - Service File: `/etc/systemd/system/monitor.service`
+
+### Log File Locations
+
+- Agent Log: `agent.log` in agent's working directory
+- Master Log: `master.log` in master's working directory
+- PID File: `/tmp/agent.pid`
+
 ### Agent Deployment
 
-The build process creates a self-extracting installer (`monitor_installer`) that simplifies agent deployment. This installer:
+The build process creates a self-extracting installer (`monitor`) that simplifies agent deployment. This installer:
 - Packages the agent executable and service file
 - Handles installation and service setup
 - Supports custom installation paths
@@ -101,13 +145,13 @@ scp monitor_installer user@remote:/tmp/
 2. Run the installer:
 ```bash
 # Default installation (/etc/monitor)
-sudo ./monitor_installer
+sudo ./monitor
 
 # Custom installation path
-sudo ./monitor_installer -p /opt/monitor
+sudo ./monitor -p /opt/monitor
 
 # Extract only (no service installation)
-./monitor_installer -e -p /path/to/extract
+./monitor -e -p /path/to/extract
 ```
 
 The installer will:
@@ -284,6 +328,7 @@ Features:
 - Graceful shutdown support
 
 ## Troubleshooting
+
 
 ### Common Issues
 

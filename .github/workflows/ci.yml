@@ -105,11 +105,11 @@ jobs:
         cp out/master artifacts/
         cp out/monitor artifacts/
         cp out/monitor.service artifacts/
-        tar -czf monitor-binaries.tar.gz -C artifacts .
+        #tar -czf monitor-binaries.tar.gz -C artifacts .
 
     - name: Upload Artifacts
       uses: actions/upload-artifact@v3
       with:
-        name: monitor-binaries
-        path: monitor-binaries.tar.gz
+        name: build-artifacts
+        path: artifacts
         retention-days: 15
