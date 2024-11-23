@@ -27,7 +27,7 @@ private:
     
     // Private constructor for singleton pattern
     Logger() {
-        log_path = "agent.log";
+        log_path = "/var/log/moniagent.log";
         log_file.open(log_path, std::ios::app);
     }
 
@@ -516,7 +516,18 @@ void handle_file_transfers(Redis &redis, const std::string &hostname) {
         }
     }
 }
+
+void print_version() {
+    std::cout << "Monitor Agent version: " << "VERSION_PLACEHOLDER" << std::endl;
+}
+
 int main(int argc, char* argv[]) {
+    // Check for version flag
+    if (argc > 1 && std::string(argv[1]) == "-v") {
+        print_version();
+        return 0;
+    }
+
     // Check for command line arguments
     if (argc > 1) {
         std::string arg(argv[1]);

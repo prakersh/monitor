@@ -535,30 +535,40 @@ void handle_cli_input(Redis &redis, int argc, char *argv[]) {
                       << "2 - Send command: ./master 2 <hostname> <command>\n"
                       << "3 - Interactive moni.sh: ./master 3 <hostname>\n"
                       << "4 - Send file: ./master 4 <hostname> <local_path> <remote_path>\n"
-                      << "5 - Receive file: ./master 5 <hostname> <remote_path> <local_path>\n";
+                      << "5 - Receive file: ./master 5 <hostname> <remote_path> <local_path>\n"
+                      << "-v - Print version information\n";
     }
+}
+
+void print_version() {
+    std::cout << "Monitor Master version: " << "VERSION_PLACEHOLDER" << std::endl;
 }
 
 // Main function
 int main(int argc, char *argv[]) {
+    // Check for version flag first
+    if (argc > 1 && std::string(argv[1]) == "-v") {
+        print_version();
+        return 0;
+    }
 
     auto redis = Redis("tcp://REDIS_HOST_PLACEHOLDER:6379?password=REDIS_PASS_PLACEHOLDER"); 
     std::cout << "Connected to Redis\n";
 
     // Initialize next_agent_id in Redis if it doesn't exist
-    if (!redis.exists("next_agent_id")) {// Initialize the next agent ID in Redis, starting from 1
-        redis.set("next_agent_id", std::to_string(1));  // Start agent IDs from 1
+    if (!redis.exists("next_agent_id")) {
+        redis.set("next_agent_id", std::to_string(1));
     }
 
     // Check if there are CLI arguments provided
     if (argc > 1) {
         std::string input(argv[1]);
         try {
-            handle_cli_input(redis, argc, argv);  // Process CLI input directly
+            handle_cli_input(redis, argc, argv);
         } catch (const Error &e) {
             std::cerr << "Redis error: " << e.what() << std::endl;
         }
-        return 0;  // Exit after processing CLI input
+        return 0;
     }
 
     // Interactive mode if no CLI arguments

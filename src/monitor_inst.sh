@@ -4,16 +4,22 @@ INSTALL_PATH="/etc/monitor"
 EXTRACT_ONLY=false
 
 print_usage() {
-    echo "Usage: $0 [-p install_path] [-e]"
+    echo "Usage: $0 [-p install_path] [-e] [-v]"
     echo "  -p: Installation path (default: /etc/monitor)"
     echo "  -e: Extract only, don't install"
+    echo "  -v: Print version information"
     exit 1
 }
 
-while getopts "p:e" opt; do
+print_version() {
+    echo "Monitor Installer version: VERSION_PLACEHOLDER"
+}
+
+while getopts "p:ev" opt; do
     case $opt in
         p) INSTALL_PATH="$OPTARG" ;;
         e) EXTRACT_ONLY=true ;;
+        v) print_version; exit 0 ;;
         *) print_usage ;;
     esac
 done

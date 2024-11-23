@@ -69,8 +69,11 @@ This will create:
 ### Build Options
 
 ```bash
-# Build both master and agent with installer
+# Build with default settings (auto-incremented version)
 ./build.sh --redis-host your.redis.host --redis-pass your_password
+
+# Build with specific version
+./build.sh --redis-host your.redis.host --redis-pass your_password --version 1.5.2
 
 # Build specific component
 ./build.sh --target agent --redis-host your.redis.host --redis-pass your_password
@@ -82,6 +85,82 @@ This will create:
 - `--redis-pass`: Redis server password (required)
 - `--target`: Component to build (optional)
   - Valid targets: all, agent, master (default: all)
+- `--version`: Build version (optional)
+  - If not specified, auto-increments last version number (e.g., 1.5.2 → 1.5.3)
+  - Stored in .last_version file
+
+### Version Information
+
+All components support version checking with the `-v` flag:
+
+```bash
+# Check agent version
+./agent -v
+
+# Check master version
+./master -v
+
+# Check monitor version
+./monitor -v
+```
+
+### Agent Usage
+```bash
+# Start agent as daemon
+./agent
+
+# Stop existing agent process
+./agent -k
+
+# Show version information
+./agent -v
+```
+
+**Options:**
+- `-k`: Kill existing agent process and exit
+- `-v`: Print version information
+- No arguments: Start agent as daemon
+
+### Master Usage
+
+#### Command Line Mode
+```bash
+# List all connected agents
+./master 1
+
+# Execute command on specific agent
+./master 2 hostname "command"
+
+# Open interactive shell
+./master 3 hostname
+
+# Transfer files/directories
+./master 4 hostname local_path remote_path  # Send file/directory
+./master 5 hostname remote_path local_path  # Receive file/directory
+
+# Show version information
+./master -v
+```
+
+### Installer Usage
+```bash
+# Default installation (/etc/monitor)
+sudo ./monitor
+
+# Custom installation path
+sudo ./monitor -p /opt/monitor
+
+# Extract only (no service installation)
+./monitor -e -p /path/to/extract
+
+# Show version information
+./monitor -v
+```
+
+**Installer Options:**
+- `-p <path>`: Custom installation path
+- `-e`: Extract files only, don't install service
+- `-v`: Print version information
 
 ## Binary Locations
 
@@ -139,7 +218,7 @@ To deploy an agent:
 
 1. Copy the installer to target machine:
 ```bash
-scp monitor_installer user@remote:/tmp/
+scp monitor user@remote:/tmp/
 ```
 
 2. Run the installer:

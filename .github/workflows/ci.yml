@@ -39,10 +39,14 @@ jobs:
     - name: Start Agent
       run: |
         sudo out/agent &
+        # Print version
+        sudo out/agent -v
         sleep 5
 
     - name: Basic Functionality Tests
       run: |
+        # Print version
+        out/master -v || exit 1
         # Basic connectivity test
         out/master 1
         # File transfer test
@@ -61,6 +65,8 @@ jobs:
 
     - name: Test Monitor Package
       run: |
+        set -vx
+        # Print version
         # Extract monitor package
         sudo out/monitor -e -p /tmp/monitor_test
         
