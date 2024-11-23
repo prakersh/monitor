@@ -53,7 +53,7 @@ compile_program() {
     
     # Create a temporary file with modified source
     local temp_src="temp_${src}"
-    cp "$src" "$temp_src"
+    cp "src/$src" "$temp_src"
     
     # Replace Redis connection placeholders with build-time parameters
     if [ -n "$redis_host" ]; then
@@ -63,39 +63,43 @@ compile_program() {
         echo "Error: Redis host and password are required"
         exit 1
     fi
+
+    # Create out directory if it doesn't exist
+    mkdir -p out
+
     # Compile with static linking
-    g++ -std=c++17 -I/usr/local/include -L/usr/local/lib "$temp_src" -o "$out" -lredis++ -lhiredis -luuid -static
+    g++ -std=c++17 -I/usr/local/include -L/usr/local/lib "$temp_src" -o "out/$out" -lredis++ -lhiredis -luuid -static
     local result=$?
     
     # Clean up temporary file
     rm "$temp_src"
     
     if [ $result -eq 0 ]; then
-        echo "Successfully compiled $src into $out."
+        echo "Successfully compiled $src into out/$out"
         return 0
     else
-        echo "Failed to compile $src."
+        echo "Failed to compile $src"
         return 1
     fi
 }
 
-# Add this function at the end of the existing build.sh
+# Function to create installer
 create_installer() {
     local temp_dir=$(mktemp -d)
-    local installer="monitor_installer"
+    local installer="out/monitor"
     
     echo "Creating installer package..."
     
     # Ensure files exist before copying
-  if [ ! -f "agent" ] || [ ! -f "monitor.service" ]; then
-      echo "Error: Required files not found"
-      echo "Please ensure 'agent' and 'monitor.service' exist in current directory"
-      rm -rf "$temp_dir"
-      exit 1
-  fi
+    if [ ! -f "out/agent" ] || [ ! -f "out/monitor.service" ]; then
+        echo "Error: Required files not found"
+        echo "Please ensure 'agent' and 'monitor.service' exist in out directory"
+        rm -rf "$temp_dir"
+        exit 1
+    fi
     
     # Copy files to temp directory
-    cp agent monitor.service "$temp_dir/"
+    cp out/agent out/monitor.service "$temp_dir/"
     
     # Create tar archive
     cd "$temp_dir" || exit 1
@@ -116,7 +120,7 @@ create_installer() {
     fi
     
     # Create self-extracting installer
-    cp monitor_inst.sh "$installer"
+    cp src/monitor_inst.sh "$installer"
     if [ $? -ne 0 ]; then
         echo "Error: Failed to copy installer script"
         rm -rf "$temp_dir"
@@ -136,7 +140,7 @@ create_installer() {
 
 # Parse command line arguments
 REDIS_HOST="prakersh.in"
-REDIS_PASS="Jmnwgh87nOCVOWc6RYuQbNa/5DmDon3uQEjVAHbJ2Vj5xNeSvw4urxydZxeeEbkP4YCrGPb3OiYknuvk"
+REDIS_PASS=""
 BUILD_TARGET="all"
 
 while [[ $# -gt 0 ]]; do
@@ -163,6 +167,9 @@ done
 # Check dependencies first
 check_dependencies
 
+# Create out directory if it doesn't exist
+mkdir -p out
+
 # Compile based on target
 case $BUILD_TARGET in
     "all")
@@ -170,7 +177,7 @@ case $BUILD_TARGET in
         compile_program "master.cpp" "master" "$REDIS_HOST" "$REDIS_PASS" || exit 1
         
         # Create monitor.service file
-        cat > monitor.service << 'EOL'
+        cat > out/monitor.service << 'EOL'
 [Unit]
 Description=Remote System Management Agent
 After=network.target

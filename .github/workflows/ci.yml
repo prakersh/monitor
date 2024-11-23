@@ -24,32 +24,92 @@ jobs:
     steps:
     - uses: actions/checkout@v3
 
-  
     - name: Build Project
       run: |
         sudo ./build.sh --redis-host localhost --redis-pass "" --target all
 
+    - name: Test Binaries
+      run: |
+        # Check if binaries exist
+        test -f out/agent || exit 1
+        test -f out/master || exit 1
+        test -f out/monitor || exit 1
+        test -f out/monitor.service || exit 1
+
     - name: Start Agent
       run: |
-        ./agent &
+        sudo out/agent &
         sleep 5
 
-    - name: Run Tests
+    - name: Basic Functionality Tests
       run: |
         # Basic connectivity test
-        ./master 1
+        out/master 1
         # File transfer test
         echo "test" > test.txt
-        host=$(./master 1 | grep Hostname | awk {'print $3'})
-        ./master 4 $host test.txt /tmp/test.txt
+        host=$(out/master 1 | grep Hostname | awk {'print $3'})
+        out/master 4 $host test.txt /tmp/test.txt
         # Command execution test
-        ./master 2 $host "ls -l /tmp/test.txt"
-        ./master 2 $host "cat /tmp/test.txt"
-        # File recieve test
-        ./master 5 $host /tmp/test.txt test2.txt
+        out/master 2 $host "ls -l /tmp/test.txt"
+        out/master 2 $host "cat /tmp/test.txt"
+        # File receive test
+        out/master 5 $host /tmp/test.txt test2.txt
         cat test2.txt
-        
-
     - name: Stop Agent
       run: |
-        ./agent -k 
+        sudo out/agent -k
+
+    - name: Test Monitor Package
+      run: |
+        # Extract monitor package
+        sudo out/monitor -e -p /tmp/monitor_test
+        
+        # Verify extracted files
+        test -f /tmp/monitor_test/agent || exit 1
+        test -f /tmp/monitor_test/monitor.service || exit 1
+        # Test service installation
+        sudo out/monitor -p /etc/monitor_test
+        
+        # Verify service is running
+        sudo systemctl is-active monitor || exit 1
+        
+        # Test service restart protection
+        sudo systemctl restart monitor
+        sleep 5
+        sudo systemctl is-active monitor || exit 1
+        # Basic connectivity test
+        out/master 1
+        # File transfer test
+        echo "test" > test_send.txt
+        host=$(out/master 1 | grep Hostname | awk {'print $3'})
+        out/master 4 $host test_send.txt /tmp/test_send.txt
+        # Command execution test
+        out/master 2 $host "ls -l /tmp/test_send.txt"
+        out/master 2 $host "cat /tmp/test_send.txt"
+        # File receive test
+        out/master 5 $host /tmp/test_send.txt test_recv.txt
+        cat test_recv.txt
+        # Verify file contents match
+        diff test_send.txt test_recv.txt || exit 1
+
+        # Cleanup
+        sudo systemctl stop monitor
+        sudo systemctl disable monitor
+        sudo rm -rf /etc/monitor_test
+
+
+    - name: Package Binaries
+      run: |
+        mkdir -p artifacts
+        cp out/agent artifacts/
+        cp out/master artifacts/
+        cp out/monitor artifacts/
+        cp out/monitor.service artifacts/
+        tar -czf monitor-binaries.tar.gz -C artifacts .
+
+    - name: Upload Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: monitor-binaries
+        path: monitor-binaries.tar.gz
+        retention-days: 15

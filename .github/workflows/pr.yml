@@ -15,9 +15,9 @@ jobs:
 
     - name: Static Analysis
       run: |
-        cppcheck --enable=all --suppress=missingIncludeSystem ./*.cpp
+        cppcheck --enable=all --suppress=missingIncludeSystem ./src/*.cpp
 
     - name: Check Format
       run: |
         sudo apt-get install -y clang-format
-        clang-format -n *.cpp 
+        clang-format -n ./src/*.cpp
