@@ -22,7 +22,7 @@ private:
     
     // Private constructor for singleton pattern
     Logger() {
-        log_path = "master.log";
+        log_path = "/var/log/master.log";
         checkAndRotateLog();
         log_file.open(log_path, std::ios::app);
     }
@@ -212,35 +212,43 @@ std::string create_tar_archive(const std::string& folder_path) {
     if (!fs::exists(folder_path)) {
         throw std::runtime_error("Source path does not exist: " + folder_path);
     }
-    
+
     if (!fs::is_directory(folder_path)) {
         throw std::runtime_error("Source path is not a directory: " + folder_path);
     }
-    
+
     std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
-    
-    // Change to use -C with the actual directory and . to tar current directory contents
-    std::string cmd = "tar -cf " + temp_tar + " -C " + folder_path + " .";
-    
+
+    // Create tar with directory name as root in archive
+    // This preserves the directory structure when extracting
+    std::string parent_dir = fs::path(folder_path).parent_path().string();
+    std::string dir_name = fs::path(folder_path).filename().string();
+
+    if (parent_dir.empty()) {
+        parent_dir = ".";
+    }
+
+    std::string cmd = "tar -cf " + temp_tar + " -C " + parent_dir + " " + dir_name;
+
     int result = system(cmd.c_str());
     if (result != 0) {
         throw std::runtime_error("Failed to create tar archive. Command: " + cmd);
     }
-    
+
     // Read the tar file into memory
     std::ifstream tar_file(temp_tar, std::ios::binary);
     if (!tar_file.is_open()) {
         std::remove(temp_tar.c_str());
         throw std::runtime_error("Failed to read tar archive");
     }
-    
+
     std::stringstream buffer;
     buffer << tar_file.rdbuf();
     tar_file.close();
-    
+
     // Clean up temporary tar file
     std::remove(temp_tar.c_str());
-    
+
     return buffer.str();
 }
 
@@ -249,34 +257,50 @@ void extract_tar_archive(const std::string& tar_content, const std::string& dest
     std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
     auto logger = Logger::getInstance();
 
-     
     // Write the tar content to temporary file
     std::ofstream tar_file(temp_tar, std::ios::binary);
     tar_file << tar_content;
     tar_file.close();
-    std::string temp_path = fs::path(dest_path).parent_path().string();
-    if (temp_path.empty()) {
-        temp_path = "./";
-    }
-    logger->info("FILE", "Extracting tar archive to: " + temp_path);
-    
-    // Extract the tar archive
-    std::string cmd = "mkdir -p " + temp_path +"; tar -xf " + temp_tar + " -C " + temp_path;
-    
-    logger->info("FILE", "Command: " + cmd);
+
+    // Create destination directory
+    fs::create_directories(dest_path);
+
+    logger->info("FILE", "Extracting tar archive to: " + dest_path);
+
+    // Extract the tar archive into a temporary location first
+    std::string temp_extract = "/tmp/" + generate_uuid();
+    fs::create_directories(temp_extract);
+
+    std::string cmd = "tar -xf " + temp_tar + " -C " + temp_extract;
     int result = system(cmd.c_str());
-    
-    // Clean up temporary tar file
-    std::remove(temp_tar.c_str());
-    
+
     if (result != 0) {
+        std::remove(temp_tar.c_str());
+        fs::remove_all(temp_extract);
         throw std::runtime_error("Failed to extract tar archive");
     }
+
+    // Find the extracted directory (should be only one)
+    for (const auto& entry : fs::directory_iterator(temp_extract)) {
+        if (fs::is_directory(entry.path())) {
+            // Move contents from the extracted directory to destination
+            for (const auto& subentry : fs::directory_iterator(entry.path())) {
+                fs::copy(subentry.path(), dest_path / subentry.path().filename(),
+                        fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+            }
+            break;
+        }
+    }
+
+    // Clean up temporary files
+    std::remove(temp_tar.c_str());
+    fs::remove_all(temp_extract);
 }
 
 
 // List all connected agents
 void list_agents(Redis &redis) {
+    auto logger = Logger::getInstance();
     std::vector<std::string> keys;
     redis.keys("agents:*", std::back_inserter(keys));  // Fetch all agent-related keys
 
@@ -288,6 +312,9 @@ void list_agents(Redis &redis) {
         auto agent_id = redis.get(hostname + "_agent_id");
         auto user = redis.get(hostname + "_user");
         auto active = redis.get(hostname + "_active");
+
+        // Log connection event
+        logger->connection(hostname, "LISTED");
 
         // Print agent information
         std::cout << "- Hostname: " << hostname
@@ -340,8 +367,12 @@ void send_file_to_agent(Redis &redis, const std::string &hostname,
         redis.hset(transfer_key, "content", content);
         redis.hset(transfer_key, "is_directory", is_directory ? "1" : "0");
         
-        // Monitor transfer status
-        while (true) {
+        // Monitor transfer status with timeout
+        const int MAX_WAIT_SECONDS = 30;
+        const int MAX_RETRIES = MAX_WAIT_SECONDS * 10;  // Check every 100ms
+        int retry_count = 0;
+
+        while (retry_count < MAX_RETRIES) {
             auto status = redis.hget(transfer_key, "status");
             if (status) {
                 if (*status == "completed") {
@@ -357,6 +388,13 @@ void send_file_to_agent(Redis &redis, const std::string &hostname,
                 }
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            retry_count++;
+        }
+
+        if (retry_count >= MAX_RETRIES) {
+            logger->error("FILE", "Transfer timeout: Agent did not respond within " + std::to_string(MAX_WAIT_SECONDS) + " seconds");
+            std::cerr << "Error: File transfer timeout - agent did not respond" << std::endl;
+            redis.del(transfer_key);
         }
         
     } catch (const std::exception& e) {
@@ -380,8 +418,12 @@ void receive_file_from_agent(Redis &redis, const std::string &hostname,
     bool is_directory = false;
     logger->info("FILE", "Checking remote path type: " + remote_path);
     
-    // Wait for type check response
-    while (true) {
+    // Wait for type check response with timeout
+    const int MAX_WAIT_SECONDS = 30;
+    const int MAX_RETRIES = MAX_WAIT_SECONDS * 10;
+    int retry_count = 0;
+
+    while (retry_count < MAX_RETRIES) {
         auto status = redis.hget(check_key, "status");
         if (status && *status == "completed") {
             auto type = redis.hget(check_key, "type");
@@ -391,6 +433,14 @@ void receive_file_from_agent(Redis &redis, const std::string &hostname,
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        retry_count++;
+    }
+
+    if (retry_count >= MAX_RETRIES) {
+        logger->error("FILE", "Type check timeout: Agent did not respond within " + std::to_string(MAX_WAIT_SECONDS) + " seconds");
+        std::cerr << "Error: Type check timeout - agent did not respond" << std::endl;
+        redis.del(check_key);
+        return;
     }
     
     // Create parent directory if needed
@@ -423,8 +473,9 @@ void receive_file_from_agent(Redis &redis, const std::string &hostname,
     redis.hset(transfer_key, "path", remote_path);
     redis.hset(transfer_key, "is_directory", is_directory ? "1" : "0");
     
-    // Wait for response
-    while (true) {
+    // Wait for response with timeout
+    retry_count = 0;
+    while (retry_count < MAX_RETRIES) {
         auto status = redis.hget(transfer_key, "status");
         if (status) {
             if (*status == "completed") {
@@ -461,6 +512,13 @@ void receive_file_from_agent(Redis &redis, const std::string &hostname,
             }
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        retry_count++;
+    }
+
+    if (retry_count >= MAX_RETRIES) {
+        logger->error("FILE", "Transfer timeout: Agent did not respond within " + std::to_string(MAX_WAIT_SECONDS) + " seconds");
+        std::cerr << "Error: File transfer timeout - agent did not respond" << std::endl;
+        redis.del(transfer_key);
     }
     logger->info("FILE", "---------------------------");
 }

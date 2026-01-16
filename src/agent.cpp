@@ -17,6 +17,7 @@
 #include <limits.h>
 #include <filesystem>
 #include <uuid/uuid.h>
+#include <sys/wait.h>
 namespace fs = std::filesystem;
 class Logger {
 private:
@@ -148,22 +149,29 @@ std::string create_tar_archive(const std::string& folder_path) {
 
 void extract_tar_archive(const std::string& tar_content, const std::string& dest_path) {
     std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
-    
+
     // Write the tar content to temporary file
     std::ofstream tar_file(temp_tar, std::ios::binary);
     tar_file << tar_content;
     tar_file.close();
-    
-    // Create the destination directory itself
-    fs::create_directories(dest_path);
-    
-    // Extract the tar archive directly into the destination directory
-    std::string cmd = "tar -xf " + temp_tar + " -C " + dest_path;
+
+    // Get parent directory of destination path
+    std::string parent_dir = fs::path(dest_path).parent_path().string();
+    if (parent_dir.empty()) {
+        parent_dir = ".";
+    }
+
+    // Create parent directory
+    fs::create_directories(parent_dir);
+
+    // Extract the tar archive into the parent directory
+    // This preserves the directory structure from the tar
+    std::string cmd = "tar -xf " + temp_tar + " -C " + parent_dir;
     int result = system(cmd.c_str());
-    
+
     // Clean up temporary tar file
     std::remove(temp_tar.c_str());
-    
+
     if (result != 0) {
         throw std::runtime_error("Failed to extract tar archive");
     }
@@ -200,13 +208,24 @@ void execute_command(const std::string &cmd, int &return_code, std::string &stdo
         logger->error("Failed to execute command: " + cmd);
         return;
     }
-    
+
     char buffer[128];
     while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
         stdout_data += buffer;
     }
-    return_code = pclose(pipe);
-    
+    int status = pclose(pipe);
+
+    // Extract actual exit code from status returned by pclose
+    // pclose returns: exit_code << 8 (if exited normally) or signal number (if killed)
+    if (WIFEXITED(status)) {
+        return_code = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        return_code = 128 + WTERMSIG(status);  // Standard convention for signals
+        stderr_data += "\n[Process terminated by signal " + std::to_string(WTERMSIG(status)) + "]";
+    } else {
+        return_code = status;  // Fallback
+    }
+
     logger->debug("Command executed. Return code: " + std::to_string(return_code));
 }
 
@@ -351,9 +370,32 @@ void register_agent(Redis &redis, const std::string &hostname) {
     }
 }
 
+// Global variables for cleanup
+Redis* global_redis = nullptr;
+std::string global_hostname;
+auto global_logger = Logger::getInstance();
+
+// Signal handler for graceful shutdown
+void signal_handler(int signum) {
+    if (global_redis) {
+        try {
+            std::string active_key = global_hostname + "_active";
+            global_redis->del(active_key);
+            global_logger->info("Agent shutting down gracefully, removed active flag");
+        } catch (const std::exception& e) {
+            global_logger->error("Error during shutdown cleanup: " + std::string(e.what()));
+        }
+    }
+
+    // Remove PID file
+    std::remove("/tmp/agent.pid");
+
+    exit(signum);
+}
+
 void daemonize() {
     auto logger = Logger::getInstance();
-    
+
     // First fork
     pid_t pid = fork();
     if (pid < 0) {
@@ -413,10 +455,54 @@ void kill_existing_instance() {
         pid_file.close();
 
         if (kill(old_pid, 0) == 0) {
-            // Process exists, kill it
+            // Process exists, try graceful shutdown first
             kill(old_pid, SIGTERM);
-            std::cout << "Killed existing agent process with PID: " << old_pid << std::endl;
-            sleep(1); // Wait for process to terminate
+            std::cout << "Sent SIGTERM to agent process with PID: " << old_pid << std::endl;
+
+            // Wait up to 3 seconds for graceful shutdown
+            for (int i = 0; i < 30; i++) {
+                if (kill(old_pid, 0) != 0) {
+                    std::cout << "Agent process terminated gracefully" << std::endl;
+                    std::remove("/tmp/agent.pid");
+                    // Clean up active flag in Redis
+                    try {
+                        auto redis = Redis("tcp://REDIS_HOST_PLACEHOLDER:6379?password=REDIS_PASS_PLACEHOLDER");
+                        std::string hostname = get_hostname();
+                        redis.del(hostname + "_active");
+                        redis.del("agent:" + hostname);
+                    } catch (...) {
+                        // Ignore Redis errors during cleanup
+                    }
+                    return;
+                }
+                usleep(100000); // 100ms
+            }
+
+            // Force kill if still running
+            kill(old_pid, SIGKILL);
+            std::cout << "Force killed agent process with SIGKILL" << std::endl;
+            std::remove("/tmp/agent.pid");
+            // Clean up active flag in Redis
+            try {
+                auto redis = Redis("tcp://REDIS_HOST_PLACEHOLDER:6379?password=REDIS_PASS_PLACEHOLDER");
+                std::string hostname = get_hostname();
+                redis.del(hostname + "_active");
+                redis.del("agent:" + hostname);
+            } catch (...) {
+                // Ignore Redis errors during cleanup
+            }
+        } else {
+            // Process doesn't exist, clean up stale PID file
+            std::remove("/tmp/agent.pid");
+            // Also clean up active flag in Redis
+            try {
+                auto redis = Redis("tcp://REDIS_HOST_PLACEHOLDER:6379?password=REDIS_PASS_PLACEHOLDER");
+                std::string hostname = get_hostname();
+                redis.del(hostname + "_active");
+                redis.del("agent:" + hostname);
+            } catch (...) {
+                // Ignore Redis errors during cleanup
+            }
         }
     }
 }
@@ -550,13 +636,21 @@ int main(int argc, char* argv[]) {
 
         // Daemonize the process
         daemonize();
-        
+
         logger->info("Agent daemonized successfully");
 
         auto redis = Redis("tcp://REDIS_HOST_PLACEHOLDER:6379?password=REDIS_PASS_PLACEHOLDER");
         logger->info("Connected to Redis server");
 
         std::string hostname = get_hostname();
+
+        // Set global variables for signal handler
+        global_redis = &redis;
+        global_hostname = hostname;
+
+        // Set up signal handlers for graceful shutdown (after global variables are assigned)
+        signal(SIGTERM, signal_handler);
+        signal(SIGINT, signal_handler);
 
         std::thread metrics_thread(collect_and_send_metrics, std::ref(redis), hostname);
         std::thread command_thread(listen_for_commands, std::ref(redis), hostname);
