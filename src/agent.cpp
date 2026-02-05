@@ -143,57 +143,188 @@ std::string get_hostname() {
     }
     return "unknown";
 }
-// Helper function to create a tar archive of a folder
-std::string create_tar_archive(const std::string& folder_path) {
-    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
-    std::string cmd = "tar -cf " + temp_tar + " -C " + 
-                     fs::path(folder_path).parent_path().string() + " " + 
-                     fs::path(folder_path).filename().string();
-    
-    int result = system(cmd.c_str());
-    if (result != 0) {
-        throw std::runtime_error("Failed to create tar archive");
+// Validate path to prevent directory traversal attacks
+bool is_path_traversal_safe(const std::string& path) {
+    // Check for common traversal patterns
+    if (path.find("..") != std::string::npos) {
+        return false;
     }
     
-    // Read the tar file into memory
-    std::ifstream tar_file(temp_tar, std::ios::binary);
-    std::stringstream buffer;
-    buffer << tar_file.rdbuf();
-    tar_file.close();
+    // Check for null bytes
+    if (path.find('\0') != std::string::npos) {
+        return false;
+    }
     
-    // Clean up temporary tar file
-    std::remove(temp_tar.c_str());
+    // Additional check: path should not start with / to prevent absolute paths
+    // unless explicitly allowed (we'll be more restrictive here)
+    if (path.empty()) {
+        return false;
+    }
     
-    return buffer.str();
+    return true;
+}
+
+// Execute tar command safely using fork+execvp
+int execute_tar_safely(const std::vector<std::string>& args) {
+    pid_t pid = fork();
+    if (pid == -1) {
+        return -1;
+    }
+    
+    if (pid == 0) {
+        // Child process
+        // Convert vector<string> to char* array
+        std::vector<char*> argv;
+        for (const auto& arg : args) {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+        
+        // Execute tar
+        execvp("tar", argv.data());
+        
+        // If execvp returns, it failed
+        _exit(127);
+    }
+    
+    // Parent process
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        return -1;
+    }
+    
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    
+    return -1;
+}
+
+// Helper function to create a tar archive of a folder
+std::string create_tar_archive(const std::string& folder_path) {
+    // Validate input path
+    if (!is_path_traversal_safe(folder_path)) {
+        throw std::runtime_error("Invalid folder path: potential directory traversal detected");
+    }
+    
+    // Create secure temp file using mkstemp
+    std::string temp_template = "/tmp/agent_tar_XXXXXX";
+    std::vector<char> temp_buffer(temp_template.begin(), temp_template.end());
+    temp_buffer.push_back('\0');
+    
+    int fd = mkstemp(temp_buffer.data());
+    if (fd == -1) {
+        throw std::runtime_error("Failed to create temporary file");
+    }
+    
+    std::string temp_tar(temp_buffer.data());
+    close(fd);
+    
+    // Add .tar extension
+    std::string temp_tar_final = temp_tar + ".tar";
+    if (rename(temp_tar.c_str(), temp_tar_final.c_str()) != 0) {
+        std::remove(temp_tar.c_str());
+        throw std::runtime_error("Failed to rename temporary file");
+    }
+    temp_tar = temp_tar_final;
+    
+    try {
+        fs::path folder_fs_path(folder_path);
+        std::string parent_dir = folder_fs_path.parent_path().string();
+        std::string folder_name = folder_fs_path.filename().string();
+        
+        if (parent_dir.empty()) {
+            parent_dir = ".";
+        }
+        
+        // Build tar command arguments
+        std::vector<std::string> tar_args = {
+            "tar", "-cf", temp_tar, "-C", parent_dir, folder_name
+        };
+        
+        int result = execute_tar_safely(tar_args);
+        if (result != 0) {
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to create tar archive, exit code: " + std::to_string(result));
+        }
+        
+        // Read the tar file into memory
+        std::ifstream tar_file(temp_tar, std::ios::binary);
+        if (!tar_file.is_open()) {
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to read tar archive");
+        }
+        
+        std::stringstream buffer;
+        buffer << tar_file.rdbuf();
+        tar_file.close();
+        
+        // Clean up temporary tar file
+        std::remove(temp_tar.c_str());
+        
+        return buffer.str();
+    } catch (...) {
+        // Ensure cleanup on any exception
+        std::remove(temp_tar.c_str());
+        throw;
+    }
 }
 
 void extract_tar_archive(const std::string& tar_content, const std::string& dest_path) {
-    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
-
-    // Write the tar content to temporary file
-    std::ofstream tar_file(temp_tar, std::ios::binary);
-    tar_file << tar_content;
-    tar_file.close();
-
-    // Get parent directory of destination path
-    std::string parent_dir = fs::path(dest_path).parent_path().string();
-    if (parent_dir.empty()) {
-        parent_dir = ".";
+    // Validate destination path
+    if (!is_path_traversal_safe(dest_path)) {
+        throw std::runtime_error("Invalid destination path: potential directory traversal detected");
     }
-
-    // Create parent directory
-    fs::create_directories(parent_dir);
-
-    // Extract the tar archive into the parent directory
-    // This preserves the directory structure from the tar
-    std::string cmd = "tar -xf " + temp_tar + " -C " + parent_dir;
-    int result = system(cmd.c_str());
-
-    // Clean up temporary tar file
-    std::remove(temp_tar.c_str());
-
-    if (result != 0) {
-        throw std::runtime_error("Failed to extract tar archive");
+    
+    // Create secure temp file for tar content
+    std::string temp_template = "/tmp/agent_tar_XXXXXX";
+    std::vector<char> temp_buffer(temp_template.begin(), temp_template.end());
+    temp_buffer.push_back('\0');
+    
+    int fd = mkstemp(temp_buffer.data());
+    if (fd == -1) {
+        throw std::runtime_error("Failed to create temporary file for extraction");
+    }
+    
+    std::string temp_tar(temp_buffer.data());
+    
+    try {
+        // Write tar content to temp file
+        if (write(fd, tar_content.data(), tar_content.size()) != static_cast<ssize_t>(tar_content.size())) {
+            close(fd);
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to write tar content to temporary file");
+        }
+        close(fd);
+        
+        // Get parent directory of destination path
+        fs::path dest_fs_path(dest_path);
+        std::string parent_dir = dest_fs_path.parent_path().string();
+        if (parent_dir.empty()) {
+            parent_dir = ".";
+        }
+        
+        // Create parent directory
+        fs::create_directories(parent_dir);
+        
+        // Build tar command arguments for extraction
+        std::vector<std::string> tar_args = {
+            "tar", "-xf", temp_tar, "-C", parent_dir
+        };
+        
+        int result = execute_tar_safely(tar_args);
+        
+        // Clean up temporary tar file
+        std::remove(temp_tar.c_str());
+        
+        if (result != 0) {
+            throw std::runtime_error("Failed to extract tar archive, exit code: " + std::to_string(result));
+        }
+    } catch (...) {
+        // Ensure cleanup on any exception
+        close(fd);
+        std::remove(temp_tar.c_str());
+        throw;
     }
 }
 

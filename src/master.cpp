@@ -10,6 +10,10 @@
 #include <mutex>
 #include <algorithm>
 #include <cctype>
+#include <vector>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <fcntl.h>
 
 namespace fs = std::filesystem;
 
@@ -111,6 +115,58 @@ std::string generate_uuid() {
     uuid_generate(uuid);
     uuid_unparse(uuid, uuid_str);
     return std::string(uuid_str);
+}
+
+// Validate path to prevent directory traversal attacks
+bool is_path_traversal_safe(const std::string& path) {
+    // Check for common traversal patterns
+    if (path.find("..") != std::string::npos) {
+        return false;
+    }
+    
+    // Check for null bytes
+    if (path.find('\0') != std::string::npos) {
+        return false;
+    }
+    
+    // Check for empty path
+    if (path.empty()) {
+        return false;
+    }
+    
+    return true;
+}
+
+// Execute tar command safely using fork+execvp
+int execute_tar_safely(const std::vector<std::string>& args) {
+    pid_t pid = fork();
+    if (pid == -1) {
+        return -1;
+    }
+    
+    if (pid == 0) {
+        // Child process
+        std::vector<char*> argv;
+        for (const auto& arg : args) {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+        
+        execvp("tar", argv.data());
+        _exit(127);
+    }
+    
+    // Parent process
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        return -1;
+    }
+    
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    
+    return -1;
 }
 
 // Send a command to a specific agent
@@ -219,6 +275,11 @@ void send_command(Redis &redis, const std::string &hostname, const std::string &
 }
 // Helper function to create a tar archive of a folder
 std::string create_tar_archive(const std::string& folder_path) {
+    // Validate input path
+    if (!is_path_traversal_safe(folder_path)) {
+        throw std::runtime_error("Invalid folder path: potential directory traversal detected");
+    }
+    
     if (!fs::exists(folder_path)) {
         throw std::runtime_error("Source path does not exist: " + folder_path);
     }
@@ -227,84 +288,150 @@ std::string create_tar_archive(const std::string& folder_path) {
         throw std::runtime_error("Source path is not a directory: " + folder_path);
     }
 
-    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
-
-    // Create tar with directory name as root in archive
-    // This preserves the directory structure when extracting
-    std::string parent_dir = fs::path(folder_path).parent_path().string();
-    std::string dir_name = fs::path(folder_path).filename().string();
-
-    if (parent_dir.empty()) {
-        parent_dir = ".";
+    // Create secure temp file using mkstemp
+    std::string temp_template = "/tmp/master_tar_XXXXXX";
+    std::vector<char> temp_buffer(temp_template.begin(), temp_template.end());
+    temp_buffer.push_back('\0');
+    
+    int fd = mkstemp(temp_buffer.data());
+    if (fd == -1) {
+        throw std::runtime_error("Failed to create temporary file");
     }
-
-    std::string cmd = "tar -cf " + temp_tar + " -C " + parent_dir + " " + dir_name;
-
-    int result = system(cmd.c_str());
-    if (result != 0) {
-        throw std::runtime_error("Failed to create tar archive. Command: " + cmd);
-    }
-
-    // Read the tar file into memory
-    std::ifstream tar_file(temp_tar, std::ios::binary);
-    if (!tar_file.is_open()) {
+    
+    std::string temp_tar(temp_buffer.data());
+    close(fd);
+    
+    // Add .tar extension
+    std::string temp_tar_final = temp_tar + ".tar";
+    if (rename(temp_tar.c_str(), temp_tar_final.c_str()) != 0) {
         std::remove(temp_tar.c_str());
-        throw std::runtime_error("Failed to read tar archive");
+        throw std::runtime_error("Failed to rename temporary file");
     }
+    temp_tar = temp_tar_final;
 
-    std::stringstream buffer;
-    buffer << tar_file.rdbuf();
-    tar_file.close();
+    try {
+        // Create tar with directory name as root in archive
+        std::string parent_dir = fs::path(folder_path).parent_path().string();
+        std::string dir_name = fs::path(folder_path).filename().string();
 
-    // Clean up temporary tar file
-    std::remove(temp_tar.c_str());
+        if (parent_dir.empty()) {
+            parent_dir = ".";
+        }
 
-    return buffer.str();
+        // Build tar command arguments
+        std::vector<std::string> tar_args = {
+            "tar", "-cf", temp_tar, "-C", parent_dir, dir_name
+        };
+
+        int result = execute_tar_safely(tar_args);
+        if (result != 0) {
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to create tar archive, exit code: " + std::to_string(result));
+        }
+
+        // Read the tar file into memory
+        std::ifstream tar_file(temp_tar, std::ios::binary);
+        if (!tar_file.is_open()) {
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to read tar archive");
+        }
+
+        std::stringstream buffer;
+        buffer << tar_file.rdbuf();
+        tar_file.close();
+
+        // Clean up temporary tar file
+        std::remove(temp_tar.c_str());
+
+        return buffer.str();
+    } catch (...) {
+        // Ensure cleanup on any exception
+        std::remove(temp_tar.c_str());
+        throw;
+    }
 }
 
 // Helper function to extract a tar archive
 void extract_tar_archive(const std::string& tar_content, const std::string& dest_path) {
-    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
+    // Validate destination path
+    if (!is_path_traversal_safe(dest_path)) {
+        throw std::runtime_error("Invalid destination path: potential directory traversal detected");
+    }
+    
     auto& logger = Logger::getInstance();
+    
+    // Create secure temp file for tar content
+    std::string temp_template = "/tmp/master_tar_XXXXXX";
+    std::vector<char> temp_buffer(temp_template.begin(), temp_template.end());
+    temp_buffer.push_back('\0');
+    
+    int fd = mkstemp(temp_buffer.data());
+    if (fd == -1) {
+        throw std::runtime_error("Failed to create temporary file for extraction");
+    }
+    
+    std::string temp_tar(temp_buffer.data());
+    
+    try {
+        // Write tar content to temp file
+        if (write(fd, tar_content.data(), tar_content.size()) != static_cast<ssize_t>(tar_content.size())) {
+            close(fd);
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to write tar content to temporary file");
+        }
+        close(fd);
 
-    // Write the tar content to temporary file
-    std::ofstream tar_file(temp_tar, std::ios::binary);
-    tar_file << tar_content;
-    tar_file.close();
+        // Create destination directory
+        fs::create_directories(dest_path);
 
-    // Create destination directory
-    fs::create_directories(dest_path);
+        logger.info("FILE", "Extracting tar archive to: " + dest_path);
 
-    logger.info("FILE", "Extracting tar archive to: " + dest_path);
+        // Extract the tar archive into a temporary location first
+        std::string temp_extract = "/tmp/master_extract_XXXXXX";
+        std::vector<char> extract_buffer(temp_extract.begin(), temp_extract.end());
+        extract_buffer.push_back('\0');
+        
+        char* extract_dir = mkdtemp(extract_buffer.data());
+        if (extract_dir == nullptr) {
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to create temporary extraction directory");
+        }
+        temp_extract = std::string(extract_dir);
 
-    // Extract the tar archive into a temporary location first
-    std::string temp_extract = "/tmp/" + generate_uuid();
-    fs::create_directories(temp_extract);
+        // Build tar command arguments
+        std::vector<std::string> tar_args = {
+            "tar", "-xf", temp_tar, "-C", temp_extract
+        };
+        
+        int result = execute_tar_safely(tar_args);
 
-    std::string cmd = "tar -xf " + temp_tar + " -C " + temp_extract;
-    int result = system(cmd.c_str());
+        if (result != 0) {
+            std::remove(temp_tar.c_str());
+            fs::remove_all(temp_extract);
+            throw std::runtime_error("Failed to extract tar archive, exit code: " + std::to_string(result));
+        }
 
-    if (result != 0) {
+        // Find the extracted directory (should be only one)
+        for (const auto& entry : fs::directory_iterator(temp_extract)) {
+            if (fs::is_directory(entry.path())) {
+                // Move contents from the extracted directory to destination
+                for (const auto& subentry : fs::directory_iterator(entry.path())) {
+                    fs::copy(subentry.path(), dest_path / subentry.path().filename(),
+                            fs::copy_options::recursive | fs::copy_options::overwrite_existing);
+                }
+                break;
+            }
+        }
+
+        // Clean up temporary files
         std::remove(temp_tar.c_str());
         fs::remove_all(temp_extract);
-        throw std::runtime_error("Failed to extract tar archive");
+    } catch (...) {
+        // Ensure cleanup on any exception
+        close(fd);
+        std::remove(temp_tar.c_str());
+        throw;
     }
-
-    // Find the extracted directory (should be only one)
-    for (const auto& entry : fs::directory_iterator(temp_extract)) {
-        if (fs::is_directory(entry.path())) {
-            // Move contents from the extracted directory to destination
-            for (const auto& subentry : fs::directory_iterator(entry.path())) {
-                fs::copy(subentry.path(), dest_path / subentry.path().filename(),
-                        fs::copy_options::recursive | fs::copy_options::overwrite_existing);
-            }
-            break;
-        }
-    }
-
-    // Clean up temporary files
-    std::remove(temp_tar.c_str());
-    fs::remove_all(temp_extract);
 }
 
 
@@ -550,6 +677,7 @@ bool is_valid_integer(const std::string& str) {
     return true;
 }
 
+// Validate path to prevent directory traversal attacks
 void handle_cli_input(Redis &redis, int argc, char *argv[]) {
     // Validate first argument is a valid option number
     if (!is_valid_integer(argv[1])) {
