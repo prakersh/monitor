@@ -369,17 +369,19 @@ void extract_tar_archive(const std::string& tar_content, const std::string& dest
     if (fd == -1) {
         throw std::runtime_error("Failed to create temporary file for extraction");
     }
-    
+
     std::string temp_tar(temp_buffer.data());
-    
+
     try {
         // Write tar content to temp file
-        if (write(fd, tar_content.data(), tar_content.size()) != static_cast<ssize_t>(tar_content.size())) {
-            close(fd);
+        ssize_t written = write(fd, tar_content.data(), tar_content.size());
+        close(fd);
+        fd = -1;
+
+        if (written != static_cast<ssize_t>(tar_content.size())) {
             std::remove(temp_tar.c_str());
             throw std::runtime_error("Failed to write tar content to temporary file");
         }
-        close(fd);
 
         // Create destination directory
         fs::create_directories(dest_path);
@@ -390,7 +392,7 @@ void extract_tar_archive(const std::string& tar_content, const std::string& dest
         std::string temp_extract = "/tmp/master_extract_XXXXXX";
         std::vector<char> extract_buffer(temp_extract.begin(), temp_extract.end());
         extract_buffer.push_back('\0');
-        
+
         char* extract_dir = mkdtemp(extract_buffer.data());
         if (extract_dir == nullptr) {
             std::remove(temp_tar.c_str());
@@ -402,7 +404,7 @@ void extract_tar_archive(const std::string& tar_content, const std::string& dest
         std::vector<std::string> tar_args = {
             "tar", "-xf", temp_tar, "-C", temp_extract
         };
-        
+
         int result = execute_tar_safely(tar_args);
 
         if (result != 0) {
@@ -427,8 +429,7 @@ void extract_tar_archive(const std::string& tar_content, const std::string& dest
         std::remove(temp_tar.c_str());
         fs::remove_all(temp_extract);
     } catch (...) {
-        // Ensure cleanup on any exception
-        close(fd);
+        if (fd != -1) close(fd);
         std::remove(temp_tar.c_str());
         throw;
     }

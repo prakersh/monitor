@@ -285,44 +285,45 @@ void extract_tar_archive(const std::string& tar_content, const std::string& dest
     if (fd == -1) {
         throw std::runtime_error("Failed to create temporary file for extraction");
     }
-    
+
     std::string temp_tar(temp_buffer.data());
-    
+
     try {
         // Write tar content to temp file
-        if (write(fd, tar_content.data(), tar_content.size()) != static_cast<ssize_t>(tar_content.size())) {
-            close(fd);
+        ssize_t written = write(fd, tar_content.data(), tar_content.size());
+        close(fd);
+        fd = -1;
+
+        if (written != static_cast<ssize_t>(tar_content.size())) {
             std::remove(temp_tar.c_str());
             throw std::runtime_error("Failed to write tar content to temporary file");
         }
-        close(fd);
-        
+
         // Get parent directory of destination path
         fs::path dest_fs_path(dest_path);
         std::string parent_dir = dest_fs_path.parent_path().string();
         if (parent_dir.empty()) {
             parent_dir = ".";
         }
-        
+
         // Create parent directory
         fs::create_directories(parent_dir);
-        
+
         // Build tar command arguments for extraction
         std::vector<std::string> tar_args = {
             "tar", "-xf", temp_tar, "-C", parent_dir
         };
-        
+
         int result = execute_tar_safely(tar_args);
-        
+
         // Clean up temporary tar file
         std::remove(temp_tar.c_str());
-        
+
         if (result != 0) {
             throw std::runtime_error("Failed to extract tar archive, exit code: " + std::to_string(result));
         }
     } catch (...) {
-        // Ensure cleanup on any exception
-        close(fd);
+        if (fd != -1) close(fd);
         std::remove(temp_tar.c_str());
         throw;
     }
