@@ -22,7 +22,7 @@ jobs:
           --health-retries 5
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
 
     - name: Build Project
       run: |
@@ -114,7 +114,7 @@ jobs:
         #tar -czf monitor-binaries.tar.gz -C artifacts .
 
     - name: Upload Artifacts
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: build-artifacts
         path: artifacts
