@@ -2,7 +2,7 @@
 
 [![CI](https://github.com/prakersh/monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/prakersh/monitor/actions/workflows/ci.yml)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
-[![Version](https://img.shields.io/badge/version-1.5.9-blue.svg)](.last_version)
+[![Version](https://img.shields.io/badge/version-1.5.16-blue.svg)](.last_version)
 
 A distributed command execution and monitoring system with master-agent architecture, built in C++ using Redis as a message broker.
 
@@ -30,8 +30,8 @@ A distributed command execution and monitoring system with master-agent architec
 
 - **Distributed Command Execution** — run commands on remote agents with full stdout/stderr/exit code capture
 - **Bidirectional File Transfer** — send and receive files and directories between master and agents
-- **System Metrics** — automatic collection of RAM, CPU, and load average every 60 seconds
-- **Interactive Shell** — remote shell access to agents via `moni.sh`
+- **System Metrics** — automatic collection of RAM usage and load average every 60 seconds
+- **Interactive Shell** — remote interactive command session with agents
 - **Self-Extracting Installer** — single-binary deployment for agents with systemd integration
 - **Static Binaries** — portable, statically linked executables
 - **Structured Logging** — categorized logs with automatic 10MB rotation
@@ -41,10 +41,10 @@ A distributed command execution and monitoring system with master-agent architec
 
 All command execution uses `fork()`/`execvp()` directly — no shell interpretation. Key protections:
 
-- **Command validation** — dangerous characters (`;`, `&&`, `||`, `` ` ``, `$`) are blocked
+- **Command validation** — dangerous characters (`;`, `&&`, `||`, `|`, `` ` ``, `$`, `<`, `>`) are blocked
 - **Path traversal prevention** — `..` patterns and null bytes rejected
 - **Secure temp files** — atomic creation with `mkstemp()`, no race conditions
-- **Timeouts** — 60-second limit on command execution
+- **Timeouts** — 60-second master-side timeout waiting for command results
 - **Signal safety** — async-signal-safe handlers using atomic flags
 - **Thread-safe logging** — mutex-protected singleton logger
 
@@ -167,7 +167,7 @@ The GitHub Actions workflow (`.github/workflows/ci.yml`) runs on every push and 
 
 ### Local Test Suite
 
-A comprehensive test suite with 350+ cases lives in `tests/`:
+A comprehensive test suite with 300+ cases lives in `tests/`:
 
 ```bash
 cd tests
@@ -189,7 +189,7 @@ monitor/
 │   ├── master.cpp           # Master control app
 │   ├── monitor_inst.sh      # Self-extracting installer script
 │   └── uninstall.sh         # Uninstaller
-├── tests/                   # Test suite (350+ cases)
+├── tests/                   # Test suite (300+ cases)
 ├── build.sh                 # Build script
 ├── .github/workflows/
 │   ├── ci.yml               # CI/CD pipeline
@@ -212,7 +212,7 @@ redis-cli ping                       # Redis reachable?
 ```bash
 out/master 1                         # agent listed?
 out/master 2 <host> "echo test"      # simple command works?
-cat master.log                       # master-side errors
+cat /var/log/master.log              # master-side errors
 ```
 
 **File transfer fails** — check disk space (`df -h`), permissions, and `grep FILE master.log`.

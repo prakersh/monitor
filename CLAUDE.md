@@ -25,11 +25,11 @@ MONITOR is a distributed command execution and monitoring system with a master-a
 **Master (`src/master.cpp`):**
 - Connects to Redis and manages agents
 - Interactive mode (no args) or CLI mode (with args)
-- Logs to `master.log` with categories: COMMAND, FILE, CONNECTION
+- Logs to `/var/log/master.log` with categories: COMMAND, FILE, CONNECTION
 - Supports 5 operations via CLI:
   1. List agents (option 1)
   2. Send command (option 2): `./master 2 <hostname> <command>`
-  3. Interactive shell (option 3): `./master 3 <hostname>` (moni.sh)
+  3. Interactive shell (option 3): `./master 3 <hostname>`
   4. Send file (option 4): `./master 4 <hostname> <local_path> <remote_path>`
   5. Receive file (option 5): `./master 5 <hostname> <remote_path> <local_path>`
 
@@ -122,8 +122,8 @@ sudo out/agent -k
 
 **Directory handling:**
 - Directories are tarred before transfer (agent and master both use `tar -cf` / `tar -xf`)
-- Uses system `tar` command via `system()`
-- Temp files stored in `/tmp/<uuid>.tar`
+- Uses `fork()`/`execvp()` via `execute_tar_safely()` (no shell interpretation)
+- Temp files created atomically via `mkstemp()`
 
 **Flow:**
 1. Master checks if path is directory via `check_type` operation
@@ -152,7 +152,7 @@ Redis credentials are **injected at build time** via placeholders in source:
 
 ### Debugging
 - **Agent logs:** `/var/log/moniagent.log`
-- **Master logs:** `master.log` (in working directory)
+- **Master logs:** `/var/log/master.log`
 - **Redis keys:** Use `redis-cli` to inspect state
 - **Process management:** PID file at `/tmp/agent.pid`
 
@@ -187,7 +187,7 @@ out/master 1  # List agents
 - **Static linking:** Binaries are statically linked for portability
 - **Daemonization:** Agent uses double-fork to daemonize
 - **Log rotation:** Both agent and master rotate at 10MB
-- **Command execution:** Uses `popen()` with `2>&1` for stderr capture
+- **Command execution:** Uses `fork()`/`execvp()` with separate stdout/stderr pipes
 - **cd command:** Special handling in `execute_command()` - changes agent's working directory
 - **UUID generation:** Uses libuuid (`uuid_generate()`)
-- **Tar operations:** Uses system `tar` command (requires tar installed)
+- **Tar operations:** Uses `fork()`/`execvp()` to run `tar` (requires tar installed)
