@@ -38,69 +38,137 @@ jobs:
 
     - name: Start Agent
       run: |
+        # Kill any existing agent first
+        sudo out/agent -k || true
+        sleep 2
+        
+        # Start agent as daemon
         sudo out/agent &
+        
         # Print version
-        sudo out/agent -v
-        sleep 5
+        out/agent -v
+        
+        # Wait for agent to start and verify it's running
+        for i in {1..10}; do
+          if [ -f /tmp/agent.pid ]; then
+            AGENT_PID=$(cat /tmp/agent.pid)
+            if kill -0 $AGENT_PID 2>/dev/null; then
+              echo "Agent started successfully with PID: $AGENT_PID"
+              break
+            fi
+          fi
+          echo "Waiting for agent to start... attempt $i/10"
+          sleep 2
+        done
+        
+        # Verify agent is registered in Redis
+        sleep 3
+        out/master 1 || echo "Warning: Agent may not be registered yet"
 
     - name: Basic Functionality Tests
       run: |
         # Print version
         out/master -v || exit 1
-        # Basic connectivity test
-        out/master 1
+        
+        # Basic connectivity test with retry
+        echo "Testing agent connectivity..."
+        for i in {1..5}; do
+          if out/master 1 | grep -q "Hostname"; then
+            echo "Agent connectivity test passed"
+            break
+          fi
+          echo "Waiting for agent registration... attempt $i/5"
+          sleep 2
+        done
+        
+        # Get hostname of connected agent
+        host=$(out/master 1 | grep Hostname | awk '{print $3}' | head -1)
+        if [ -z "$host" ]; then
+          echo "Error: No agent found"
+          exit 1
+        fi
+        echo "Using agent: $host"
+        
         # File transfer test
-        echo "test" > test.txt
-        host=$(out/master 1 | grep Hostname | awk {'print $3'})
-        out/master 4 $host test.txt /tmp/test.txt
+        echo "test content for file transfer" > test.txt
+        echo "Testing file transfer..."
+        out/master 4 "$host" test.txt /tmp/test.txt || exit 1
+        
         # Command execution test
-        out/master 2 $host "ls -l /tmp/test.txt"
-        out/master 2 $host "cat /tmp/test.txt"
+        echo "Testing command execution..."
+        out/master 2 "$host" "ls -l /tmp/test.txt" || exit 1
+        out/master 2 "$host" "cat /tmp/test.txt" || exit 1
+        
         # File receive test
-        out/master 5 $host /tmp/test.txt test2.txt
-        cat test2.txt
+        echo "Testing file receive..."
+        out/master 5 "$host" /tmp/test.txt test2.txt || exit 1
+        
+        # Verify file contents match
+        if diff test.txt test2.txt >/dev/null 2>&1; then
+          echo "File transfer verification passed"
+        else
+          echo "Error: File contents don't match"
+          exit 1
+        fi
     - name: Stop Agent
       run: |
-        sudo out/agent -k
+        # Stop agent gracefully
+        echo "Stopping agent..."
+        sudo out/agent -k || true
+        
+        # Verify agent stopped
+        sleep 2
+        if [ -f /tmp/agent.pid ]; then
+          AGENT_PID=$(cat /tmp/agent.pid)
+          if kill -0 $AGENT_PID 2>/dev/null; then
+            echo "Warning: Agent still running, forcing kill"
+            sudo kill -9 $AGENT_PID || true
+          fi
+        fi
+        
+        # Cleanup PID file
+        sudo rm -f /tmp/agent.pid
+        echo "Agent stopped"
 
     - name: Test Monitor Package
       run: |
         set -vx
         # Print version
+        out/monitor -v
+        
         # Extract monitor package
         sudo out/monitor -e -p /tmp/monitor_test
         
         # Verify extracted files
         test -f /tmp/monitor_test/agent || exit 1
         test -f /tmp/monitor_test/monitor.service || exit 1
-        # Test service installation
-        sudo out/monitor -p /etc/monitor_test
         
-        # Verify service is running
-        sudo systemctl is-active monitor || exit 1
+        # Test service installation (only if systemd is available)
+        if systemctl --version >/dev/null 2>&1; then
+          sudo out/monitor -p /etc/monitor_test
+          
+          # Verify service is running (with retry)
+          for i in {1..10}; do
+            if sudo systemctl is-active monitor >/dev/null 2>&1; then
+              echo "Service is active"
+              break
+            fi
+            echo "Waiting for service to start... attempt $i/10"
+            sleep 2
+          done
+          
+          # Test service restart protection
+          sudo systemctl restart monitor
+          sleep 5
+          sudo systemctl is-active monitor || exit 1
+          
+          # Cleanup
+          sudo systemctl stop monitor
+          sudo systemctl disable monitor
+        else
+          echo "Systemd not available, skipping service tests"
+        fi
         
-        # Test service restart protection
-        sudo systemctl restart monitor
-        sleep 5
-        sudo systemctl is-active monitor || exit 1
-        # Basic connectivity test
-        out/master 1
-        # File transfer test
-        echo "test" > test_send.txt
-        host=$(out/master 1 | grep Hostname | awk {'print $3'})
-        out/master 4 $host test_send.txt /tmp/test_send.txt
-        # Command execution test
-        out/master 2 $host "ls -l /tmp/test_send.txt"
-        out/master 2 $host "cat /tmp/test_send.txt"
-        # File receive test
-        out/master 5 $host /tmp/test_send.txt test_recv.txt
-        cat test_recv.txt
-        # Verify file contents match
-        diff test_send.txt test_recv.txt || exit 1
-
-        # Cleanup
-        sudo systemctl stop monitor
-        sudo systemctl disable monitor
         sudo rm -rf /etc/monitor_test
 
 

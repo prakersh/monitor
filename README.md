@@ -35,6 +35,18 @@ A distributed command execution and monitoring system with master-agent architec
 - **Self-Extracting Installer** — single-binary deployment for agents with systemd integration
 - **Static Binaries** — portable, statically linked executables
 - **Structured Logging** — categorized logs with automatic 10MB rotation
+- **Security Hardened** — no `system()`/`popen()` calls, command injection prevention, path traversal protection, secure temp files via `mkstemp()`
+
+## Security
+
+All command execution uses `fork()`/`execvp()` directly — no shell interpretation. Key protections:
+
+- **Command validation** — dangerous characters (`;`, `&&`, `||`, `` ` ``, `$`) are blocked
+- **Path traversal prevention** — `..` patterns and null bytes rejected
+- **Secure temp files** — atomic creation with `mkstemp()`, no race conditions
+- **Timeouts** — 60-second limit on command execution
+- **Signal safety** — async-signal-safe handlers using atomic flags
+- **Thread-safe logging** — mutex-protected singleton logger
 
 ## Quick Start
 

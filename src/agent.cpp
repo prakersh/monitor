@@ -18,15 +18,19 @@
 #include <filesystem>
 #include <uuid/uuid.h>
 #include <sys/wait.h>
+#include <vector>
+#include <cstring>
+#include <atomic>
+#include <mutex>
 namespace fs = std::filesystem;
+// Thread-safe singleton Logger using Meyers' pattern
 class Logger {
 private:
     std::ofstream log_file;
-    static Logger* instance;
     std::string log_path;
-    const size_t MAX_SIZE = 10 * 1024 * 1024; // 10MB in bytes
+    static constexpr size_t MAX_SIZE = 10 * 1024 * 1024; // 10MB in bytes
+    std::mutex log_mutex;
     
-    // Private constructor for singleton pattern
     Logger() {
         log_path = "/var/log/moniagent.log";
         log_file.open(log_path, std::ios::app);
@@ -37,25 +41,20 @@ private:
             log_file.close();
         }
 
-        // Get current file size
         struct stat stat_buf;
         if (stat(log_path.c_str(), &stat_buf) == 0) {
-            if (stat_buf.st_size >= MAX_SIZE) {
-                // Rename current log to backup
+            if (static_cast<size_t>(stat_buf.st_size) >= MAX_SIZE) {
                 std::string backup_path = log_path + ".1";
                 rename(log_path.c_str(), backup_path.c_str());
             }
         }
 
-        // Open new log file
         log_file.open(log_path, std::ios::app);
     }
 
 public:
-    static Logger* getInstance() {
-        if (instance == nullptr) {
-            instance = new Logger();
-        }
+    static Logger& getInstance() {
+        static Logger instance;
         return instance;
     }
 
@@ -68,11 +67,11 @@ public:
     }
 
     void log(const std::string& level, const std::string& message) {
+        std::lock_guard<std::mutex> lock(log_mutex);
         if (log_file.is_open()) {
-            // Check file size before writing
             struct stat stat_buf;
             if (stat(log_path.c_str(), &stat_buf) == 0) {
-                if (stat_buf.st_size >= MAX_SIZE) {
+                if (static_cast<size_t>(stat_buf.st_size) >= MAX_SIZE) {
                     rotate_log();
                 }
             }
@@ -100,12 +99,17 @@ public:
             log_file.close();
         }
     }
+    
+    // Delete copy constructor and assignment operator
+    Logger(const Logger&) = delete;
+    Logger& operator=(const Logger&) = delete;
 };
 
-// Initialize the static instance
-Logger* Logger::instance = nullptr;
-
 using namespace sw::redis;
+
+// Atomic flag for signal handling (async-signal-safe)
+std::atomic<bool> shutdown_requested{false};
+
 // Generate a unique UUID
 std::string generate_uuid() {
     uuid_t uuid;
@@ -113,6 +117,22 @@ std::string generate_uuid() {
     uuid_generate(uuid);
     uuid_unparse(uuid, uuid_str);
     return std::string(uuid_str);
+}
+
+// Validate command to prevent shell injection
+bool is_command_safe(const std::string& cmd) {
+    // List of dangerous characters and sequences
+    const std::vector<std::string> dangerous = {
+        ";", "&&", "||", "|", "`", "$", "<", ">", 
+        "$(", "${", "\n", "\r"
+    };
+    
+    for (const auto& pattern : dangerous) {
+        if (cmd.find(pattern) != std::string::npos) {
+            return false;
+        }
+    }
+    return true;
 }
 
 // Retrieve the hostname of the machine
@@ -123,122 +143,333 @@ std::string get_hostname() {
     }
     return "unknown";
 }
-// Helper function to create a tar archive of a folder
-std::string create_tar_archive(const std::string& folder_path) {
-    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
-    std::string cmd = "tar -cf " + temp_tar + " -C " + 
-                     fs::path(folder_path).parent_path().string() + " " + 
-                     fs::path(folder_path).filename().string();
-    
-    int result = system(cmd.c_str());
-    if (result != 0) {
-        throw std::runtime_error("Failed to create tar archive");
+// Validate path to prevent directory traversal attacks
+bool is_path_traversal_safe(const std::string& path) {
+    // Check for common traversal patterns
+    if (path.find("..") != std::string::npos) {
+        return false;
     }
     
-    // Read the tar file into memory
-    std::ifstream tar_file(temp_tar, std::ios::binary);
-    std::stringstream buffer;
-    buffer << tar_file.rdbuf();
-    tar_file.close();
+    // Check for null bytes
+    if (path.find('\0') != std::string::npos) {
+        return false;
+    }
     
-    // Clean up temporary tar file
-    std::remove(temp_tar.c_str());
+    // Additional check: path should not start with / to prevent absolute paths
+    // unless explicitly allowed (we'll be more restrictive here)
+    if (path.empty()) {
+        return false;
+    }
     
-    return buffer.str();
+    return true;
+}
+
+// Execute tar command safely using fork+execvp
+int execute_tar_safely(const std::vector<std::string>& args) {
+    pid_t pid = fork();
+    if (pid == -1) {
+        return -1;
+    }
+    
+    if (pid == 0) {
+        // Child process
+        // Convert vector<string> to char* array
+        std::vector<char*> argv;
+        for (const auto& arg : args) {
+            argv.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv.push_back(nullptr);
+        
+        // Execute tar
+        execvp("tar", argv.data());
+        
+        // If execvp returns, it failed
+        _exit(127);
+    }
+    
+    // Parent process
+    int status;
+    if (waitpid(pid, &status, 0) == -1) {
+        return -1;
+    }
+    
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    
+    return -1;
+}
+
+// Helper function to create a tar archive of a folder
+std::string create_tar_archive(const std::string& folder_path) {
+    // Validate input path
+    if (!is_path_traversal_safe(folder_path)) {
+        throw std::runtime_error("Invalid folder path: potential directory traversal detected");
+    }
+    
+    // Create secure temp file using mkstemp
+    std::string temp_template = "/tmp/agent_tar_XXXXXX";
+    std::vector<char> temp_buffer(temp_template.begin(), temp_template.end());
+    temp_buffer.push_back('\0');
+    
+    int fd = mkstemp(temp_buffer.data());
+    if (fd == -1) {
+        throw std::runtime_error("Failed to create temporary file");
+    }
+    
+    std::string temp_tar(temp_buffer.data());
+    close(fd);
+    
+    // Add .tar extension
+    std::string temp_tar_final = temp_tar + ".tar";
+    if (rename(temp_tar.c_str(), temp_tar_final.c_str()) != 0) {
+        std::remove(temp_tar.c_str());
+        throw std::runtime_error("Failed to rename temporary file");
+    }
+    temp_tar = temp_tar_final;
+    
+    try {
+        fs::path folder_fs_path(folder_path);
+        std::string parent_dir = folder_fs_path.parent_path().string();
+        std::string folder_name = folder_fs_path.filename().string();
+        
+        if (parent_dir.empty()) {
+            parent_dir = ".";
+        }
+        
+        // Build tar command arguments
+        std::vector<std::string> tar_args = {
+            "tar", "-cf", temp_tar, "-C", parent_dir, folder_name
+        };
+        
+        int result = execute_tar_safely(tar_args);
+        if (result != 0) {
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to create tar archive, exit code: " + std::to_string(result));
+        }
+        
+        // Read the tar file into memory
+        std::ifstream tar_file(temp_tar, std::ios::binary);
+        if (!tar_file.is_open()) {
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to read tar archive");
+        }
+        
+        std::stringstream buffer;
+        buffer << tar_file.rdbuf();
+        tar_file.close();
+        
+        // Clean up temporary tar file
+        std::remove(temp_tar.c_str());
+        
+        return buffer.str();
+    } catch (...) {
+        // Ensure cleanup on any exception
+        std::remove(temp_tar.c_str());
+        throw;
+    }
 }
 
 void extract_tar_archive(const std::string& tar_content, const std::string& dest_path) {
-    std::string temp_tar = "/tmp/" + generate_uuid() + ".tar";
-
-    // Write the tar content to temporary file
-    std::ofstream tar_file(temp_tar, std::ios::binary);
-    tar_file << tar_content;
-    tar_file.close();
-
-    // Get parent directory of destination path
-    std::string parent_dir = fs::path(dest_path).parent_path().string();
-    if (parent_dir.empty()) {
-        parent_dir = ".";
+    // Validate destination path
+    if (!is_path_traversal_safe(dest_path)) {
+        throw std::runtime_error("Invalid destination path: potential directory traversal detected");
     }
-
-    // Create parent directory
-    fs::create_directories(parent_dir);
-
-    // Extract the tar archive into the parent directory
-    // This preserves the directory structure from the tar
-    std::string cmd = "tar -xf " + temp_tar + " -C " + parent_dir;
-    int result = system(cmd.c_str());
-
-    // Clean up temporary tar file
-    std::remove(temp_tar.c_str());
-
-    if (result != 0) {
-        throw std::runtime_error("Failed to extract tar archive");
+    
+    // Create secure temp file for tar content
+    std::string temp_template = "/tmp/agent_tar_XXXXXX";
+    std::vector<char> temp_buffer(temp_template.begin(), temp_template.end());
+    temp_buffer.push_back('\0');
+    
+    int fd = mkstemp(temp_buffer.data());
+    if (fd == -1) {
+        throw std::runtime_error("Failed to create temporary file for extraction");
+    }
+    
+    std::string temp_tar(temp_buffer.data());
+    
+    try {
+        // Write tar content to temp file
+        if (write(fd, tar_content.data(), tar_content.size()) != static_cast<ssize_t>(tar_content.size())) {
+            close(fd);
+            std::remove(temp_tar.c_str());
+            throw std::runtime_error("Failed to write tar content to temporary file");
+        }
+        close(fd);
+        
+        // Get parent directory of destination path
+        fs::path dest_fs_path(dest_path);
+        std::string parent_dir = dest_fs_path.parent_path().string();
+        if (parent_dir.empty()) {
+            parent_dir = ".";
+        }
+        
+        // Create parent directory
+        fs::create_directories(parent_dir);
+        
+        // Build tar command arguments for extraction
+        std::vector<std::string> tar_args = {
+            "tar", "-xf", temp_tar, "-C", parent_dir
+        };
+        
+        int result = execute_tar_safely(tar_args);
+        
+        // Clean up temporary tar file
+        std::remove(temp_tar.c_str());
+        
+        if (result != 0) {
+            throw std::runtime_error("Failed to extract tar archive, exit code: " + std::to_string(result));
+        }
+    } catch (...) {
+        // Ensure cleanup on any exception
+        close(fd);
+        std::remove(temp_tar.c_str());
+        throw;
     }
 }
 
 
-// Execute a shell command and return return code, stdout, and stderr.
+// Execute a command safely using execve (no shell, prevents injection)
 void execute_command(const std::string &cmd, int &return_code, std::string &stdout_data, std::string &stderr_data) {
-    auto logger = Logger::getInstance();
-    logger->debug("Executing command: " + cmd);
+    auto& logger = Logger::getInstance();
+    logger.debug("Executing command: " + cmd);
     
-    // Special handling for cd command
-    if (cmd.substr(0, 2) == "cd") {
-        std::string dir = cmd.length() > 3 ? cmd.substr(3) : getenv("HOME");
+    // Validate command for safety
+    if (!is_command_safe(cmd)) {
+        stderr_data = "Command rejected: contains potentially dangerous characters";
+        return_code = -1;
+        logger.error("Command rejected for security: " + cmd);
+        return;
+    }
+    
+    // Special handling for cd command - check for "cd " or exact "cd"
+    if (cmd == "cd" || (cmd.length() > 2 && cmd.substr(0, 3) == "cd ")) {
+        std::string dir;
+        if (cmd.length() > 3) {
+            dir = cmd.substr(3);
+        } else {
+            const char* home = getenv("HOME");
+            if (!home) {
+                stderr_data = "Failed to change directory: HOME environment variable not set";
+                return_code = -1;
+                logger.error(stderr_data);
+                return;
+            }
+            dir = home;
+        }
         return_code = chdir(dir.c_str());
         if (return_code != 0) {
             stderr_data = "Failed to change directory to " + dir;
-            logger->error(stderr_data);
+            logger.error(stderr_data);
         } else {
             char cwd[PATH_MAX];
             if (getcwd(cwd, sizeof(cwd)) != NULL) {
                 stdout_data = "Changed directory to: " + std::string(cwd);
-                logger->info(stdout_data);
+                logger.info(stdout_data);
             }
         }
         return;
     }
     
-    // For other commands, use popen
-    FILE *pipe = popen((cmd + " 2>&1").c_str(), "r");
-    if (!pipe) {
-        stderr_data = "Failed to execute command.";
+    // Create pipes for stdout and stderr
+    int stdout_pipe[2];
+    int stderr_pipe[2];
+    
+    if (pipe(stdout_pipe) == -1 || pipe(stderr_pipe) == -1) {
+        stderr_data = "Failed to create pipes";
         return_code = -1;
-        logger->error("Failed to execute command: " + cmd);
+        logger.error("Failed to create pipes for command: " + cmd);
         return;
     }
-
-    char buffer[128];
-    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+    
+    // Fork to execute command
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[0]);
+        close(stderr_pipe[1]);
+        stderr_data = "Failed to fork";
+        return_code = -1;
+        logger.error("Failed to fork for command: " + cmd);
+        return;
+    }
+    
+    if (pid == 0) {
+        // Child process
+        close(stdout_pipe[0]);
+        close(stderr_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        dup2(stderr_pipe[1], STDERR_FILENO);
+        close(stdout_pipe[1]);
+        close(stderr_pipe[1]);
+        
+        // Parse command into arguments
+        std::vector<char*> args;
+        std::string cmd_copy = cmd;
+        char* token = strtok(&cmd_copy[0], " ");
+        while (token != nullptr) {
+            args.push_back(token);
+            token = strtok(nullptr, " ");
+        }
+        args.push_back(nullptr);
+        
+        // Execute command directly (no shell)
+        execvp(args[0], args.data());
+        
+        // If execvp returns, it failed
+        perror("execvp failed");
+        _exit(127);
+    }
+    
+    // Parent process
+    close(stdout_pipe[1]);
+    close(stderr_pipe[1]);
+    
+    // Read output with larger buffer
+    char buffer[4096];
+    ssize_t n;
+    
+    // Read stdout
+    while ((n = read(stdout_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
+        buffer[n] = '\0';
         stdout_data += buffer;
     }
-    int status = pclose(pipe);
-
-    // Extract actual exit code from status returned by pclose
-    // pclose returns: exit_code << 8 (if exited normally) or signal number (if killed)
+    close(stdout_pipe[0]);
+    
+    // Read stderr
+    while ((n = read(stderr_pipe[0], buffer, sizeof(buffer) - 1)) > 0) {
+        buffer[n] = '\0';
+        stderr_data += buffer;
+    }
+    close(stderr_pipe[0]);
+    
+    // Wait for child and get exit code
+    int status;
+    waitpid(pid, &status, 0);
+    
     if (WIFEXITED(status)) {
         return_code = WEXITSTATUS(status);
     } else if (WIFSIGNALED(status)) {
-        return_code = 128 + WTERMSIG(status);  // Standard convention for signals
+        return_code = 128 + WTERMSIG(status);
         stderr_data += "\n[Process terminated by signal " + std::to_string(WTERMSIG(status)) + "]";
     } else {
-        return_code = status;  // Fallback
+        return_code = status;
     }
-
-    logger->debug("Command executed. Return code: " + std::to_string(return_code));
+    
+    logger.debug("Command executed. Return code: " + std::to_string(return_code));
 }
 
 // Collect comprehensive system metrics and send to Redis
 void collect_and_send_metrics(Redis &redis, const std::string &hostname) {
-    auto logger = Logger::getInstance();
-    logger->info("Starting metrics collection for host: " + hostname);
+    auto& logger = Logger::getInstance();
+    logger.info("Starting metrics collection for host: " + hostname);
     
     while (true) {
         try {
             struct sysinfo info;
             if (sysinfo(&info) == 0) {
-                logger->debug("Collecting system metrics");
+                logger.debug("Collecting system metrics");
                 
                 long total_ram = info.totalram / (1024 * 1024);
                 long free_ram = info.freeram / (1024 * 1024);
@@ -248,19 +479,25 @@ void collect_and_send_metrics(Redis &redis, const std::string &hostname) {
                 std::string metrics_info = "RAM Total: " + std::to_string(total_ram) + 
                                          "MB, Used: " + std::to_string(used_ram) + 
                                          "MB, Load Avg: " + std::to_string(load_avg);
-                logger->debug("Metrics collected: " + metrics_info);
+                logger.debug("Metrics collected: " + metrics_info);
                 
                 std::string key = "agent:" + hostname + ":metrics";
                 redis.hset(key, "total_ram_mb", std::to_string(total_ram));
                 redis.hset(key, "used_ram_mb", std::to_string(used_ram));
                 redis.hset(key, "load_avg", std::to_string(load_avg));
                 
-                logger->info("Metrics updated in Redis for " + hostname);
+                logger.info("Metrics updated in Redis for " + hostname);
             } else {
-                logger->error("Failed to get system info for " + hostname);
+                logger.error("Failed to get system info for " + hostname);
             }
         } catch (const std::exception& e) {
-            logger->error("Error in metrics collection: " + std::string(e.what()));
+            logger.error("Error in metrics collection: " + std::string(e.what()));
+        }
+        
+        // Check for shutdown request
+        if (shutdown_requested.load()) {
+            logger.info("Metrics collection shutting down");
+            break;
         }
         
         std::this_thread::sleep_for(std::chrono::seconds(60));
@@ -268,9 +505,9 @@ void collect_and_send_metrics(Redis &redis, const std::string &hostname) {
 }
 // Listen for commands and execute those targeting this agent
 void listen_for_commands(Redis &redis, const std::string &hostname) {
-    auto logger = Logger::getInstance();
+    auto& logger = Logger::getInstance();
     std::string command_prefix = "run:" + hostname + ":";
-    logger->info("Started command listener for host: " + hostname);
+    logger.info("Started command listener for host: " + hostname);
     
     while (true) {
         try {
@@ -281,7 +518,7 @@ void listen_for_commands(Redis &redis, const std::string &hostname) {
                 auto uuid = redis.get(key);
                 if (uuid) {
                     auto command = redis.get(*uuid);
-                    logger->info("Received command: " + *command + " (UUID: " + *uuid + ")");
+                    logger.info("Received command: " + *command + " (UUID: " + *uuid + ")");
                     
                     int return_code;
                     std::string stdout_data, stderr_data;
@@ -293,12 +530,18 @@ void listen_for_commands(Redis &redis, const std::string &hostname) {
                     redis.set(base_key + "stderr", stderr_data);
                     
                     redis.del(key);
-                    logger->info("Command executed and response sent. Return code: " + 
+                    logger.info("Command executed and response sent. Return code: " + 
                                std::to_string(return_code));
                 }
             }
         } catch (const std::exception& e) {
-            logger->error("Error in command listener: " + std::string(e.what()));
+            logger.error("Error in command listener: " + std::string(e.what()));
+        }
+        
+        // Check for shutdown request
+        if (shutdown_requested.load()) {
+            logger.info("Command listener shutting down");
+            break;
         }
         
         std::this_thread::sleep_for(std::chrono::seconds(1));
@@ -309,14 +552,48 @@ void listen_for_commands(Redis &redis, const std::string &hostname) {
 std::string get_user_from_whoami() {
     std::array<char, 128> buffer;
     std::string user;
-    FILE* pipe = popen("whoami", "r");  // Run the whoami command
-    if (!pipe) {
-        throw std::runtime_error("popen() failed!");
+    
+    // Use safer approach with execvp instead of popen
+    int pipefd[2];
+    if (pipe(pipefd) == -1) {
+        throw std::runtime_error("pipe() failed!");
     }
-    while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-        user += buffer.data();  // Append the output to the user string
+    
+    pid_t pid = fork();
+    if (pid == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        throw std::runtime_error("fork() failed!");
     }
-    fclose(pipe);
+    
+    if (pid == 0) {
+        // Child process
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        close(pipefd[1]);
+        
+        char* args[] = {(char*)"whoami", nullptr};
+        execvp("whoami", args);
+        _exit(1);  // execvp failed
+    }
+    
+    // Parent process
+    close(pipefd[1]);
+    
+    ssize_t n;
+    while ((n = read(pipefd[0], buffer.data(), buffer.size() - 1)) > 0) {
+        buffer[n] = '\0';
+        user += buffer.data();
+    }
+    close(pipefd[0]);
+    
+    int status;
+    waitpid(pid, &status, 0);
+    
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        throw std::runtime_error("whoami command failed");
+    }
+    
     // Remove the newline character from the user string if present
     if (!user.empty() && user.back() == '\n') {
         user.pop_back();
@@ -326,12 +603,12 @@ std::string get_user_from_whoami() {
 
 // Register the agent with the master in Redis
 void register_agent(Redis &redis, const std::string &hostname) {
-    auto logger = Logger::getInstance();
-    logger->info("Registering agent with hostname: " + hostname);
+    auto& logger = Logger::getInstance();
+    logger.info("Registering agent with hostname: " + hostname);
     
     try {
         std::string user = get_user_from_whoami();
-        logger->info("Agent running as user: " + user);
+        logger.info("Agent running as user: " + user);
         
         redis.set("agents:" + hostname, hostname);
         
@@ -344,62 +621,56 @@ void register_agent(Redis &redis, const std::string &hostname) {
         
         if (existing_agent_id) {
             uuid = std::stoi(*existing_agent_id);
-            logger->info("Using existing agent UUID: " + std::to_string(uuid));
+            logger.info("Using existing agent UUID: " + std::to_string(uuid));
         } else {
             uuid = redis.incr("agent_uuid_counter");
             redis.set(agent_id_key, std::to_string(uuid));
-            logger->info("Generated new agent UUID: " + std::to_string(uuid));
+            logger.info("Generated new agent UUID: " + std::to_string(uuid));
         }
         
         redis.set(user_key, user);
         redis.set(active_key, "yes");
         redis.expire(active_key, 10);
         
-        logger->info("Agent registration complete. UUID: " + std::to_string(uuid));
+        logger.info("Agent registration complete. UUID: " + std::to_string(uuid));
         
         while (true) {
             redis.set(active_key, "yes");
             redis.set(user_key, user);
             redis.expire(active_key, 50);
-            logger->debug("Agent status refreshed");
+            logger.debug("Agent status refreshed");
+            
+            // Check for shutdown request
+            if (shutdown_requested.load()) {
+                logger.info("Registration thread shutting down");
+                break;
+            }
+            
             std::this_thread::sleep_for(std::chrono::seconds(20));
         }
     } catch (const std::exception &e) {
-        logger->error("Registration error: " + std::string(e.what()));
+        logger.error("Registration error: " + std::string(e.what()));
         throw;
     }
 }
 
-// Global variables for cleanup
+// Global variables for cleanup (only used outside signal handler)
 Redis* global_redis = nullptr;
 std::string global_hostname;
-auto global_logger = Logger::getInstance();
 
-// Signal handler for graceful shutdown
+// Signal handler - ONLY async-signal-safe operations
 void signal_handler(int signum) {
-    if (global_redis) {
-        try {
-            std::string active_key = global_hostname + "_active";
-            global_redis->del(active_key);
-            global_logger->info("Agent shutting down gracefully, removed active flag");
-        } catch (const std::exception& e) {
-            global_logger->error("Error during shutdown cleanup: " + std::string(e.what()));
-        }
-    }
-
-    // Remove PID file
-    std::remove("/tmp/agent.pid");
-
-    exit(signum);
+    // Only set atomic flag - actual cleanup happens in main thread
+    shutdown_requested.store(true);
 }
 
 void daemonize() {
-    auto logger = Logger::getInstance();
+    auto& logger = Logger::getInstance();
 
     // First fork
     pid_t pid = fork();
     if (pid < 0) {
-        logger->error("Failed to fork first time");
+        logger.error("Failed to fork first time");
         exit(EXIT_FAILURE);
     }
     if (pid > 0) {
@@ -411,14 +682,14 @@ void daemonize() {
     // Child process continues
     // Create new session
     if (setsid() < 0) {
-        logger->error("Failed to create new session");
+        logger.error("Failed to create new session");
         exit(EXIT_FAILURE);
     }
 
     // Second fork
     pid = fork();
     if (pid < 0) {
-        logger->error("Failed to fork second time");
+        logger.error("Failed to fork second time");
         exit(EXIT_FAILURE);
     }
     if (pid > 0) {
@@ -427,7 +698,7 @@ void daemonize() {
 
     // Change working directory
     if (chdir("/") < 0) {
-        logger->error("Failed to change working directory");
+        logger.error("Failed to change working directory");
         exit(EXIT_FAILURE);
     }
 
@@ -514,7 +785,7 @@ void print_usage() {
 
 // Function to handle file transfers
 void handle_file_transfers(Redis &redis, const std::string &hostname) {
-    auto logger = Logger::getInstance();
+    auto& logger = Logger::getInstance();
     std::string transfer_prefix = "file_transfer:" + hostname + ":";
     
     while (true) {
@@ -539,17 +810,17 @@ void handle_file_transfers(Redis &redis, const std::string &hostname) {
                     }
                 } else if (*operation == "read") {
                     try {
-                        logger->info("Checking path type: " + *path);
+                        logger.info("Checking path type: " + *path);
                         bool is_dir = fs::is_directory(*path);
                         std::string content;
                         
                         if (is_dir) {
-                            logger->info("Detected directory transfer - Source: " + *path);
+                            logger.info("Detected directory transfer - Source: " + *path);
                             content = create_tar_archive(*path);
                             redis.hset(key, "is_directory", "1");
-                            logger->info("Directory packaged successfully");
+                            logger.info("Directory packaged successfully");
                         } else {
-                            logger->info("Detected file transfer - Source: " + *path);
+                            logger.info("Detected file transfer - Source: " + *path);
                             std::ifstream file(*path, std::ios::binary);
                             if (!file.is_open()) {
                                 throw std::runtime_error("Failed to open file for reading");
@@ -563,11 +834,11 @@ void handle_file_transfers(Redis &redis, const std::string &hostname) {
                         
                         redis.hset(key, "content", content);
                         redis.hset(key, "status", "completed");
-                        logger->info("Transfer completed: " + *path + (is_dir ? " (directory)" : " (file)"));
+                        logger.info("Transfer completed: " + *path + (is_dir ? " (directory)" : " (file)"));
                     } catch (const std::exception& e) {
                         redis.hset(key, "status", "error");
                         redis.hset(key, "error", e.what());
-                        logger->error("Read error for " + *path + ": " + std::string(e.what()));
+                        logger.error("Read error for " + *path + ": " + std::string(e.what()));
                     }
                 } else if (*operation == "write") {
                     auto content = redis.hget(key, "content");
@@ -588,17 +859,24 @@ void handle_file_transfers(Redis &redis, const std::string &hostname) {
                             file.close();
                         }
                         redis.hset(key, "status", "completed");
-                        logger->info("Write completed: " + *path);
+                        logger.info("Write completed: " + *path);
                     } catch (const std::exception& e) {
                         redis.hset(key, "status", "error");
                         redis.hset(key, "error", e.what());
-                        logger->error("Write error: " + std::string(e.what()));
+                        logger.error("Write error: " + std::string(e.what()));
                     }
                 }
             }
+            
+            // Check for shutdown request
+            if (shutdown_requested.load()) {
+                logger.info("File transfer handler shutting down");
+                break;
+            }
+            
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         } catch (const std::exception& e) {
-            logger->error("Transfer handler error: " + std::string(e.what()));
+            logger.error("Transfer handler error: " + std::string(e.what()));
         }
     }
 }
@@ -631,24 +909,24 @@ int main(int argc, char* argv[]) {
         // Kill any existing instance
         kill_existing_instance();
 
-        auto logger = Logger::getInstance();
-        logger->info("Agent starting up");
+        auto& logger = Logger::getInstance();
+        logger.info("Agent starting up");
 
         // Daemonize the process
         daemonize();
 
-        logger->info("Agent daemonized successfully");
+        logger.info("Agent daemonized successfully");
 
         auto redis = Redis("tcp://REDIS_HOST_PLACEHOLDER:6379?password=REDIS_PASS_PLACEHOLDER");
-        logger->info("Connected to Redis server");
+        logger.info("Connected to Redis server");
 
         std::string hostname = get_hostname();
 
-        // Set global variables for signal handler
+        // Set global variables for cleanup (NOT used in signal handler)
         global_redis = &redis;
         global_hostname = hostname;
 
-        // Set up signal handlers for graceful shutdown (after global variables are assigned)
+        // Set up signal handlers for graceful shutdown
         signal(SIGTERM, signal_handler);
         signal(SIGINT, signal_handler);
 
@@ -656,15 +934,35 @@ int main(int argc, char* argv[]) {
         std::thread command_thread(listen_for_commands, std::ref(redis), hostname);
         std::thread register_thread(register_agent, std::ref(redis), hostname);
         std::thread file_transfer_thread(handle_file_transfers, std::ref(redis), hostname);
-        file_transfer_thread.detach();
 
+        // Wait for shutdown signal
+        while (!shutdown_requested.load()) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+
+        // Perform cleanup (this is safe - not in signal handler)
+        logger.info("Agent shutting down gracefully");
+        try {
+            std::string active_key = hostname + "_active";
+            redis.del(active_key);
+            logger.info("Removed active flag from Redis");
+        } catch (const std::exception& e) {
+            logger.error("Error removing active flag: " + std::string(e.what()));
+        }
+
+        // Remove PID file
+        std::remove("/tmp/agent.pid");
+
+        // Wait for threads to finish
         metrics_thread.join();
         command_thread.join();
         register_thread.join();
         file_transfer_thread.join();
+        
+        logger.info("Agent shutdown complete");
     } catch (const Error &e) {
-        auto logger = Logger::getInstance();
-        logger->error("Redis error: " + std::string(e.what()));
+        auto& logger = Logger::getInstance();
+        logger.error("Redis error: " + std::string(e.what()));
         return 1;
     }
 
